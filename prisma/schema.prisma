@@ -1,0 +1,57 @@
+// Quantchill – Prisma schema
+// Database: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          String        @id @default(cuid())
+  email       String        @unique
+  name        String?
+  isPremium   Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  moodProfile MoodProfile?
+  sessions    Session[]
+}
+
+model MoodProfile {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currentMood   String   @default("Deep Focus")
+  moodHistory   String[] @default([])
+  updatedAt     DateTime @updatedAt
+}
+
+model Session {
+  id              String           @id @default(cuid())
+  userId          String
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mood            String
+  startedAt       DateTime         @default(now())
+  endedAt         DateTime?
+  sessionTime     Int              @default(0)  // seconds elapsed
+  paywallShown    Boolean          @default(false)
+  quantchatSynced Boolean          @default(false)
+  generatedTracks GeneratedTrack[]
+}
+
+model GeneratedTrack {
+  id          String   @id @default(cuid())
+  sessionId   String
+  session     Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  mood        String
+  bpm         Int
+  key         String
+  scale       String
+  intensity   Float
+  variation   Int      @default(0)
+  generatedAt DateTime @default(now())
+}

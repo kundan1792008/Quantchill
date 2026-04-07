@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { RawData, WebSocket } from 'ws';
 import { BiometricHandshakeService, BiometricPayload } from './services/BiometricHandshakeService';
 import { MatchMaker, UserProfile, BCIContext } from './services/MatchMaker';
+import { MoodEngine, MoodName } from './services/MoodEngine';
+import { SessionTracker } from './services/SessionTracker';
 
 type SocketMessage =
   | { type: 'register'; userId: string; interestGraph: Record<string, number>; bciContext?: BCIContext }
@@ -24,6 +26,9 @@ interface ClientState {
 const app = Fastify({ logger: true });
 const handshakeService = new BiometricHandshakeService();
 const matchMaker = new MatchMaker();
+const sessionTracker = new SessionTracker();
+/** Per-session MoodEngine instances to avoid shared mutable state. */
+const sessionEngines = new Map<string, MoodEngine>();
 const clients = new Map<string, ClientState>();
 
 function sendSafe(socket: WebSocket, payload: unknown): void {
@@ -44,6 +49,110 @@ function terminateClient(clientId: string, reason: string): void {
 app.register(websocket);
 
 app.get('/health', async () => ({ status: 'ok' }));
+
+// ─── Mood Engine REST routes ─────────────────────────────────────────────────
+
+/** List all available moods (stateless – instantiate a temporary engine). */
+app.get('/moods', async () => ({
+  moods: new MoodEngine().listMoods()
+}));
+
+/** Start a new listening/watching session for a user and mood. */
+app.post<{
+  Body: { userId: string; mood: MoodName; isPremium?: boolean };
+}>('/sessions', async (request, reply) => {
+  const { userId, mood, isPremium = false } = request.body;
+
+  if (!userId || !mood) {
+    return reply.status(400).send({ error: 'userId and mood are required' });
+  }
+
+  const sessionId = randomUUID();
+  const engine = new MoodEngine(mood);
+  sessionEngines.set(sessionId, engine);
+  const state = sessionTracker.createSession({ sessionId, userId, mood, isPremium });
+  const track = engine.generateTrack(mood);
+
+  return { session: state, track };
+});
+
+/** Tick a session forward by deltaSeconds; returns a paywall trigger if needed. */
+app.post<{
+  Params: { sessionId: string };
+  Body: { deltaSeconds: number };
+}>('/sessions/:sessionId/tick', async (request, reply) => {
+  const { sessionId } = request.params;
+  const { deltaSeconds } = request.body;
+
+  if (typeof deltaSeconds !== 'number' || deltaSeconds <= 0) {
+    return reply.status(400).send({ error: 'deltaSeconds must be a positive number' });
+  }
+
+  const paywall = sessionTracker.tick(sessionId, deltaSeconds);
+  const session = sessionTracker.getSession(sessionId);
+
+  if (!session) {
+    return reply.status(404).send({ error: 'session-not-found' });
+  }
+
+  return { session, paywall: paywall ?? null };
+});
+
+/** Generate the next track variation (the "✨ Evolve Melody" button). */
+app.post<{
+  Params: { sessionId: string };
+}>('/sessions/:sessionId/evolve', async (request, reply) => {
+  const session = sessionTracker.getSession(request.params.sessionId);
+  if (!session) {
+    return reply.status(404).send({ error: 'session-not-found' });
+  }
+
+  const engine = sessionEngines.get(request.params.sessionId) ?? new MoodEngine(session.mood);
+  const track = engine.evolveTrack();
+  return { track };
+});
+
+/** BCI context evaluation – may trigger automatic mood transition. */
+app.post<{
+  Params: { sessionId: string };
+  Body: { bciContext: BCIContext };
+}>('/sessions/:sessionId/bci', async (request, reply) => {
+  const session = sessionTracker.getSession(request.params.sessionId);
+  if (!session) {
+    return reply.status(404).send({ error: 'session-not-found' });
+  }
+
+  const engine = sessionEngines.get(request.params.sessionId) ?? new MoodEngine(session.mood);
+  const transition = engine.evaluateBCIContext(request.body.bciContext);
+  const track = engine.generateTrack();
+
+  return { transition: transition ?? null, track };
+});
+
+/** Mock "Sync with Quantchat" – creates a watch/listen party. */
+app.post<{
+  Params: { sessionId: string };
+}>('/sessions/:sessionId/quantchat-sync', async (request, reply) => {
+  try {
+    const result = sessionTracker.syncWithQuantchat(request.params.sessionId);
+    return { sync: result };
+  } catch {
+    return reply.status(404).send({ error: 'session-not-found' });
+  }
+});
+
+/** End a session and retrieve its final state. */
+app.delete<{
+  Params: { sessionId: string };
+}>('/sessions/:sessionId', async (request, reply) => {
+  const { sessionId } = request.params;
+  sessionEngines.delete(sessionId);
+  const state = sessionTracker.endSession(sessionId);
+  if (!state) {
+    return reply.status(404).send({ error: 'session-not-found' });
+  }
+  return { session: state };
+});
 
 app.get('/ws', { websocket: true }, (socket) => {
   const clientId = randomUUID();
