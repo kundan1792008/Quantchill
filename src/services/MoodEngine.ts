@@ -19,7 +19,7 @@ export interface GeneratedTrackMetadata {
   key: string;
   scale: string;
   intensity: number;
-  /** Monotonically increasing counter per session; starts at 0. */
+  /** monotonically increasing counter per session; starts at 0. */
   variation: number;
 }
 
