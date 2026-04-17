@@ -11,7 +11,7 @@ import { HiveMindAlgorithm } from './services/HiveMindAlgorithm';
 import { EloService } from './services/EloService';
 import { MatchQueue } from './services/MatchQueue';
 import { MatchSignaling } from './services/MatchSignaling';
-import { SwipeProcessor, SwipeAction } from './services/SwipeProcessor';
+import { SwipeProcessor, type SwipeAction } from './services/SwipeProcessor';
 import { InterestGraph } from './services/InterestGraph';
 import { ReportService } from './services/ReportService';
 
@@ -42,6 +42,12 @@ const sessionTracker = new SessionTracker();
 /** Per-session MoodEngine instances to avoid shared mutable state. */
 const sessionEngines = new Map<string, MoodEngine>();
 const clients = new Map<string, ClientState>();
+/** userId → Set of matched userIds (mutual likes). */
+const mutualMatches = new Map<string, Set<string>>();
+/** userId → report count. Auto-ban after 3 reports. */
+const reportCounts = new Map<string, number>();
+/** Set of banned userIds. */
+const bannedUsers = new Set<string>();
 
 function sendSafe(socket: WebSocket, payload: unknown): void {
   if (socket.readyState === socket.OPEN) {
@@ -144,6 +150,7 @@ app.get<{ Params: { userId: string } }>('/elo/:userId', async (request, reply) =
   const record = eloService.getRecord(userId);
   return { ...record, bracket: eloService.getBracket(userId) };
 });
+
 
 // ─── Mood Engine REST routes ─────────────────────────────────────────────────
 

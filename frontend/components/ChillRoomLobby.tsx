@@ -19,11 +19,16 @@ export default function ChillRoomLobby({ friends }: ChillRoomLobbyProps) {
   const [joining, setJoining] = useState(false);
   const [joined, setJoined] = useState(false);
 
-  const handleJoin = async () => {
+  const handleJoin = () => {
     setJoining(true);
-    await new Promise<void>((resolve) => setTimeout(resolve, 1200));
-    setJoining(false);
-    setJoined(true);
+    new Promise<void>((resolve) => setTimeout(resolve, 1200))
+      .then(() => {
+        setJoining(false);
+        setJoined(true);
+      })
+      .catch(() => {
+        setJoining(false);
+      });
   };
 
   return (
