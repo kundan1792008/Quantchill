@@ -1,311 +1,215 @@
 /**
- * MatchSignaling — orchestrates the hand-off between "users are queued" and
- * "users are connected via WebRTC".
+ * MatchSignaling – WebRTC signaling service for matched pairs.
  *
- * Flow:
- *   1. `createRoom(a, b)` once MatchQueue has produced a pair.
- *   2. Emit `match-found` to both sides, carrying the roomId and SDP role
- *      assignment (`polite` / `impolite`, Glickman's "perfect-negotiation" idiom).
- *   3. Relay SDP offer / answer / ICE candidates through the signaling channel.
- *   4. If either side does not reach `connected` within `connectTimeoutMs`
- *      (default 10 s), invoke the re-queue callback for both.
- *
- * This module is transport-agnostic: callers pass a `sendFn` that transmits
- * the message to the right peer (WebSocket, SSE, Fastify push, etc.). That
- * keeps the service trivial to test — `MatchSignaling.test.ts` uses in-memory
- * capture.
+ * Responsibilities:
+ *  1. Create a unique room ID when a match is found via MatchQueue.
+ *  2. Notify both matched users with a `match-found` event that contains
+ *     their room credentials.
+ *  3. Relay WebRTC offer / answer / ICE-candidate messages between the two
+ *     peers through the signaling channel.
+ *  4. Enforce a 10-second connection deadline: if either user has not sent
+ *     an offer or answer within the window, both are re-queued via the
+ *     provided callback.
  */
 
+import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import type { MatchPair, QueueEntry } from './MatchQueue';
 
-/** Role assignment used by WebRTC perfect-negotiation. */
-export type SignalingRole = 'polite' | 'impolite';
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Lifecycle state of a signaling room. */
-export type RoomStatus =
-  | 'pending'       // created, waiting for offer
-  | 'offering'      // caller has sent SDP offer
-  | 'answering'     // callee has sent SDP answer
-  | 'connected'     // both sides report `connected` via `markConnected`
-  | 'expired'       // connect timeout fired
-  | 'closed';       // gracefully ended
+/** Milliseconds both peers have to exchange WebRTC signaling before re-queue. */
+const CONNECT_TIMEOUT_MS = 10_000;
 
-/** Participant metadata held inside a room. */
-export interface RoomParticipant {
-  userId: string;
-  role: SignalingRole;
-  joinedAt: number;
-  connectedAt: number | null;
-}
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-/** Signaling room state. */
-export interface SignalingRoom {
+/** Credentials sent to both participants when a match is found. */
+export interface RoomCredentials {
   roomId: string;
-  participants: [RoomParticipant, RoomParticipant];
-  status: RoomStatus;
-  createdAt: number;
+  token: string;
   expiresAt: number;
-  closedReason: string | null;
 }
 
-/** Messages the signaling layer pushes to peers. */
-export type SignalingOutbound =
-  | {
-      type: 'match-found';
-      roomId: string;
-      peerUserId: string;
-      role: SignalingRole;
-      iceServers: RTCIceServerLike[];
-      expiresAt: number;
-    }
-  | { type: 'offer'; roomId: string; fromUserId: string; sdp: unknown }
-  | { type: 'answer'; roomId: string; fromUserId: string; sdp: unknown }
-  | { type: 'ice-candidate'; roomId: string; fromUserId: string; candidate: unknown }
-  | { type: 'room-expired'; roomId: string; reason: 'connect-timeout'; expiredAt: number }
-  | { type: 'room-closed'; roomId: string; reason: string; closedAt: number };
-
-/** Minimal ICE server description — shape matches `RTCIceServer`. */
-export interface RTCIceServerLike {
-  urls: string | string[];
-  username?: string;
-  credential?: string;
+/** Internal state tracked per active signaling room. */
+interface RoomState {
+  roomId: string;
+  userA: QueueEntry;
+  userB: QueueEntry;
+  offerReceived: boolean;
+  answerReceived: boolean;
+  timeoutHandle: ReturnType<typeof setTimeout>;
+  createdAt: number;
 }
 
-/** Callback signature for transport delivery. */
-export type SignalingSendFn = (userId: string, message: SignalingOutbound) => void;
-
-/** Callback invoked when a room times out — used to re-queue both users. */
-export type RoomTimeoutFn = (room: SignalingRoom) => void;
-
-/** Config knobs for the signaling service. */
-export interface MatchSignalingConfig {
-  connectTimeoutMs: number;
-  iceServers: RTCIceServerLike[];
+/** A WebRTC signaling message forwarded between peers. */
+export interface SignalingMessage {
+  type: 'offer' | 'answer' | 'ice-candidate';
+  fromUserId: string;
+  toUserId: string;
+  payload: unknown;
+  roomId: string;
 }
 
-export const DEFAULT_SIGNALING_CONFIG: MatchSignalingConfig = {
-  connectTimeoutMs: 10_000,
-  iceServers: [{ urls: 'stun:stun.quantchill.io:3478' }]
-};
+/** Callback invoked to re-queue a user when a connection timeout fires. */
+export type RequeueCallback = (userId: string, elo: number) => void;
+
+// ─── MatchSignaling ───────────────────────────────────────────────────────────
 
 /**
- * A room is scheduled via `setTimeout`; we retain the handle so we can cancel
- * cleanly on explicit `markConnected` or `close`. In tests we inject a fake
- * scheduler via constructor arguments.
+ * MatchSignaling manages the lifecycle of a WebRTC signaling room from the
+ * moment a match is found until the connection is established (or times out).
+ *
+ * Events emitted:
+ *  - `room-created`   (roomId: string, userA: QueueEntry, userB: QueueEntry)
+ *  - `signal`         (msg: SignalingMessage) – forwarded signaling message
+ *  - `room-connected` (roomId: string) – both peers have exchanged offer+answer
+ *  - `room-timeout`   (roomId: string) – connection not established in time
+ *  - `room-closed`    (roomId: string) – room torn down after peer disconnect
  */
-export interface TimerLike {
-  setTimeout(fn: () => void, ms: number): TimerHandle;
-  clearTimeout(handle: TimerHandle): void;
-  now(): number;
-}
+export class MatchSignaling extends EventEmitter {
+  /** Active signaling rooms keyed by roomId. */
+  private readonly rooms = new Map<string, RoomState>();
 
-export type TimerHandle = unknown;
+  /** roomId → token map for lightweight credential verification. */
+  private readonly tokens = new Map<string, string>();
 
-export const NODE_TIMER: TimerLike = {
-  setTimeout: (fn, ms) => setTimeout(fn, ms),
-  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-  now: () => Date.now()
-};
-
-/** The signaling service. */
-export class MatchSignaling {
-  private readonly rooms = new Map<string, SignalingRoom>();
-  private readonly timers = new Map<string, TimerHandle>();
-  private readonly byUser = new Map<string, Set<string>>();
-  private readonly config: MatchSignalingConfig;
-
-  constructor(
-    private readonly send: SignalingSendFn,
-    private readonly onTimeout: RoomTimeoutFn,
-    overrides: Partial<MatchSignalingConfig> = {},
-    private readonly timer: TimerLike = NODE_TIMER
-  ) {
-    this.config = { ...DEFAULT_SIGNALING_CONFIG, ...overrides };
+  constructor(private readonly onRequeue?: RequeueCallback) {
+    super();
   }
 
-  /** Create a room for a newly-matched pair and emit `match-found` to both. */
-  createRoom(userAId: string, userBId: string): SignalingRoom {
-    if (userAId === userBId) {
-      throw new Error('createRoom: users must be distinct');
-    }
+  // ── Room lifecycle ───────────────────────────────────────────────────────
 
+  /**
+   * Create a new signaling room for a matched pair and schedule the
+   * connection timeout.
+   *
+   * Returns the RoomCredentials that should be forwarded to both users via
+   * whatever transport layer owns the WebSocket connections (e.g. server.ts).
+   */
+  createRoom(pair: MatchPair): { credentials: RoomCredentials; userAId: string; userBId: string } {
     const roomId = randomUUID();
-    const now = this.timer.now();
-    const expiresAt = now + this.config.connectTimeoutMs;
+    const token = randomUUID();
+    const expiresAt = Date.now() + CONNECT_TIMEOUT_MS;
 
-    // Deterministic role assignment based on lexical order of userIds —
-    // satisfies perfect-negotiation symmetry without an extra round-trip.
-    const [politeId, impoliteId] = [userAId, userBId].sort() as [string, string];
+    const timeoutHandle = setTimeout(() => {
+      this.handleTimeout(roomId);
+    }, CONNECT_TIMEOUT_MS);
 
-    const participants: [RoomParticipant, RoomParticipant] = [
-      { userId: politeId, role: 'polite', joinedAt: now, connectedAt: null },
-      { userId: impoliteId, role: 'impolite', joinedAt: now, connectedAt: null }
-    ];
-
-    const room: SignalingRoom = {
+    const state: RoomState = {
       roomId,
-      participants,
-      status: 'pending',
-      createdAt: now,
-      expiresAt,
-      closedReason: null
+      userA: pair.userA,
+      userB: pair.userB,
+      offerReceived: false,
+      answerReceived: false,
+      timeoutHandle,
+      createdAt: Date.now()
     };
 
-    this.rooms.set(roomId, room);
-    this.indexUser(userAId, roomId);
-    this.indexUser(userBId, roomId);
+    this.rooms.set(roomId, state);
+    this.tokens.set(roomId, token);
 
-    for (const participant of participants) {
-      const peer = participants.find((p) => p.userId !== participant.userId)!;
-      this.send(participant.userId, {
-        type: 'match-found',
-        roomId,
-        peerUserId: peer.userId,
-        role: participant.role,
-        iceServers: this.config.iceServers,
-        expiresAt
-      });
-    }
+    this.emit('room-created', roomId, pair.userA, pair.userB);
 
-    const handle = this.timer.setTimeout(() => this.expireRoom(roomId), this.config.connectTimeoutMs);
-    this.timers.set(roomId, handle);
-
-    return { ...room, participants: [...participants] as [RoomParticipant, RoomParticipant] };
-  }
-
-  /** Relay an SDP offer from one participant to the other. */
-  relayOffer(roomId: string, fromUserId: string, sdp: unknown): void {
-    const { room, peer } = this.requireOtherParticipant(roomId, fromUserId);
-    room.status = 'offering';
-    this.send(peer.userId, { type: 'offer', roomId, fromUserId, sdp });
-  }
-
-  /** Relay an SDP answer back to the caller. */
-  relayAnswer(roomId: string, fromUserId: string, sdp: unknown): void {
-    const { room, peer } = this.requireOtherParticipant(roomId, fromUserId);
-    room.status = 'answering';
-    this.send(peer.userId, { type: 'answer', roomId, fromUserId, sdp });
-  }
-
-  /** Relay an ICE candidate to the peer. */
-  relayIceCandidate(roomId: string, fromUserId: string, candidate: unknown): void {
-    const { peer } = this.requireOtherParticipant(roomId, fromUserId);
-    this.send(peer.userId, { type: 'ice-candidate', roomId, fromUserId, candidate });
+    const credentials: RoomCredentials = { roomId, token, expiresAt };
+    return { credentials, userAId: pair.userA.userId, userBId: pair.userB.userId };
   }
 
   /**
-   * Mark a participant as having reached the `connected` ICE state.
-   * When both participants have reported connected, the room is promoted
-   * to `connected` and the timeout is cancelled.
+   * Handle an incoming WebRTC signaling message.
+   *
+   * Validates that:
+   *  - The room exists.
+   *  - The sender is a participant in the room.
+   *  - The recipient is the other participant.
+   *
+   * Emits a `signal` event containing the message so the transport layer can
+   * forward it to the target user's WebSocket connection.
+   *
+   * Tracks offer/answer receipt to detect when the connection is established.
+   *
+   * @returns true if the message was accepted, false otherwise.
    */
-  markConnected(roomId: string, userId: string): SignalingRoom {
-    const room = this.rooms.get(roomId);
-    if (!room) throw new Error(`markConnected: unknown room ${roomId}`);
-    const participant = room.participants.find((p) => p.userId === userId);
-    if (!participant) throw new Error(`markConnected: ${userId} not in room ${roomId}`);
+  relay(msg: SignalingMessage): boolean {
+    const room = this.rooms.get(msg.roomId);
+    if (!room) return false;
 
-    participant.connectedAt = this.timer.now();
-    if (room.participants.every((p) => p.connectedAt !== null)) {
-      room.status = 'connected';
-      this.cancelTimer(roomId);
+    const participants = [room.userA.userId, room.userB.userId];
+    if (!participants.includes(msg.fromUserId)) return false;
+    if (!participants.includes(msg.toUserId)) return false;
+    if (msg.fromUserId === msg.toUserId) return false;
+
+    if (msg.type === 'offer') room.offerReceived = true;
+    if (msg.type === 'answer') room.answerReceived = true;
+
+    this.emit('signal', msg);
+
+    // Both sides have exchanged – connection is established.
+    if (room.offerReceived && room.answerReceived) {
+      this.markConnected(msg.roomId);
     }
 
-    return { ...room, participants: [...room.participants] as [RoomParticipant, RoomParticipant] };
+    return true;
   }
 
   /**
-   * Close a room gracefully. Used when one peer sends "end-call" or
-   * disconnects from the websocket, or when the caller wants to force
-   * re-queue without waiting for the connect timer.
+   * Close an active room (e.g. on peer disconnect or call end).
+   * Clears the timeout and removes the room from state.
    */
-  closeRoom(roomId: string, reason: string): SignalingRoom | null {
+  closeRoom(roomId: string): boolean {
     const room = this.rooms.get(roomId);
-    if (!room) return null;
+    if (!room) return false;
 
-    this.cancelTimer(roomId);
-    room.status = 'closed';
-    room.closedReason = reason;
-
-    const closedAt = this.timer.now();
-    for (const participant of room.participants) {
-      this.send(participant.userId, { type: 'room-closed', roomId, reason, closedAt });
-      this.deindexUser(participant.userId, roomId);
-    }
+    clearTimeout(room.timeoutHandle);
     this.rooms.delete(roomId);
-    return room;
+    this.tokens.delete(roomId);
+
+    this.emit('room-closed', roomId);
+    return true;
   }
 
-  /** Look up the room a given user is currently in, if any. */
-  roomsForUser(userId: string): string[] {
-    return Array.from(this.byUser.get(userId) ?? []);
+  /** Verify that a token is valid for a given room. */
+  verifyToken(roomId: string, token: string): boolean {
+    return this.tokens.get(roomId) === token;
   }
 
-  /** Number of live rooms — useful for metrics dashboards. */
+  /** Return whether a room currently exists. */
+  hasRoom(roomId: string): boolean {
+    return this.rooms.has(roomId);
+  }
+
+  /** Return a snapshot of current room state (for monitoring). */
+  getRoomState(roomId: string): Readonly<RoomState> | null {
+    return this.rooms.get(roomId) ?? null;
+  }
+
+  /** Return the count of active rooms. */
   activeRoomCount(): number {
     return this.rooms.size;
   }
 
-  /** Snapshot a room by id (or `null` if unknown). */
-  getRoom(roomId: string): SignalingRoom | null {
+  // ── Private helpers ──────────────────────────────────────────────────────
+
+  private markConnected(roomId: string): void {
     const room = this.rooms.get(roomId);
-    return room ? { ...room, participants: [...room.participants] as [RoomParticipant, RoomParticipant] } : null;
+    if (!room) return;
+
+    clearTimeout(room.timeoutHandle);
+    this.emit('room-connected', roomId);
   }
 
-  // ─── Internals ───────────────────────────────────────────────────────────
-
-  private requireOtherParticipant(
-    roomId: string,
-    fromUserId: string
-  ): { room: SignalingRoom; peer: RoomParticipant } {
+  private handleTimeout(roomId: string): void {
     const room = this.rooms.get(roomId);
-    if (!room) throw new Error(`signaling: unknown room ${roomId}`);
-    const peer = room.participants.find((p) => p.userId !== fromUserId);
-    if (!peer) throw new Error(`signaling: ${fromUserId} not in room ${roomId}`);
-    return { room, peer };
-  }
+    if (!room) return;
 
-  private expireRoom(roomId: string): void {
-    const room = this.rooms.get(roomId);
-    if (!room || room.status === 'connected' || room.status === 'closed') return;
+    this.rooms.delete(roomId);
+    this.tokens.delete(roomId);
 
-    room.status = 'expired';
-    room.closedReason = 'connect-timeout';
+    this.emit('room-timeout', roomId);
 
-    const expiredAt = this.timer.now();
-    for (const participant of room.participants) {
-      this.send(participant.userId, { type: 'room-expired', roomId, reason: 'connect-timeout', expiredAt });
-      this.deindexUser(participant.userId, roomId);
+    // Re-queue both users if a callback was provided.
+    if (this.onRequeue) {
+      this.onRequeue(room.userA.userId, room.userA.elo);
+      this.onRequeue(room.userB.userId, room.userB.elo);
     }
-
-    try {
-      this.onTimeout(room);
-    } finally {
-      this.rooms.delete(roomId);
-      this.timers.delete(roomId);
-    }
-  }
-
-  private cancelTimer(roomId: string): void {
-    const handle = this.timers.get(roomId);
-    if (handle !== undefined) {
-      this.timer.clearTimeout(handle);
-      this.timers.delete(roomId);
-    }
-  }
-
-  private indexUser(userId: string, roomId: string): void {
-    let set = this.byUser.get(userId);
-    if (!set) {
-      set = new Set();
-      this.byUser.set(userId, set);
-    }
-    set.add(roomId);
-  }
-
-  private deindexUser(userId: string, roomId: string): void {
-    const set = this.byUser.get(userId);
-    if (!set) return;
-    set.delete(roomId);
-    if (set.size === 0) this.byUser.delete(userId);
   }
 }

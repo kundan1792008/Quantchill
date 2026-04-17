@@ -14,14 +14,19 @@ export default function LoginPage() {
   const handleScan = async () => {
     setError('');
     setPhase('scanning');
-    // Simulate biometric scan (1.4 s)
-    await delay(1400);
-    setPhase('verifying');
-    // Simulate Quantmail identity verification (1.0 s)
-    await delay(1000);
-    setPhase('success');
-    await delay(600);
-    router.push('/dashboard');
+    try {
+      // Simulate biometric scan (1.4 s)
+      await delay(1400);
+      setPhase('verifying');
+      // Simulate Quantmail identity verification (1.0 s)
+      await delay(1000);
+      setPhase('success');
+      await delay(600);
+      router.push('/dashboard');
+    } catch {
+      setPhase('idle');
+      setError('Authentication failed. Please try again.');
+    }
   };
 
   return (

@@ -1,126 +1,124 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { InterestGraph, decayWeight } from '../src/services/InterestGraph';
-import { GlickoEngine } from '../src/services/GlickoEngine';
-import { SwipeProcessor } from '../src/services/SwipeProcessor';
+import { InterestGraph, cosineSimilarity } from '../src/services/InterestGraph';
 
-test('InterestGraph.applySignal creates a directed edge with the given delta', () => {
-  const graph = new InterestGraph();
-  const edge = graph.applySignal({
-    userId: 'a',
-    targetId: 'b',
-    delta: 4,
-    reasons: ['like', 'long-dwell'],
-    positive: true
-  });
-  assert.equal(edge.weight, 4);
-  assert.equal(edge.source, 'a');
-  assert.equal(edge.target, 'b');
-  assert.equal(graph.edgeCount(), 1);
+// ─── cosineSimilarity tests ───────────────────────────────────────────────────
+
+test('cosineSimilarity returns 1 for identical vectors', () => {
+  const v = { music: 10, travel: 5 };
+  assert.ok(Math.abs(cosineSimilarity(v, v) - 1) < 1e-10);
 });
 
-test('InterestGraph edges are directed (a→b does NOT imply b→a)', () => {
-  const graph = new InterestGraph();
-  graph.addEdge('a', 'b', 3);
-  assert.ok(graph.getEdge('a', 'b'));
-  assert.equal(graph.getEdge('b', 'a'), null);
+test('cosineSimilarity returns 0 for orthogonal vectors', () => {
+  const a = { music: 1 };
+  const b = { sports: 1 };
+  assert.equal(cosineSimilarity(a, b), 0);
 });
 
-test('InterestGraph.addEdge accumulates weights across multiple signals', () => {
-  const graph = new InterestGraph();
-  graph.addEdge('a', 'b', 2);
-  graph.addEdge('a', 'b', 3);
-  const edge = graph.getEdge('a', 'b')!;
-  assert.equal(edge.weight, 5);
-  assert.equal(edge.interactionCount, 2);
+test('cosineSimilarity returns 0 for empty vector', () => {
+  assert.equal(cosineSimilarity({}, { music: 1 }), 0);
 });
 
-test('decayWeight is monotonically non-increasing in elapsed time', () => {
-  const halfLife = 1000;
-  const a = decayWeight(10, 0, halfLife);
-  const b = decayWeight(10, 500, halfLife);
-  const c = decayWeight(10, 1000, halfLife);
-  const d = decayWeight(10, 2000, halfLife);
-  assert.ok(a >= b && b >= c && c >= d);
-  assert.ok(Math.abs(c - 5) < 1e-9);
-  assert.ok(Math.abs(d - 2.5) < 1e-9);
+test('cosineSimilarity returns a value in [0, 1]', () => {
+  const a = { music: 8, travel: 3 };
+  const b = { music: 5, travel: 9, gaming: 2 };
+  const sim = cosineSimilarity(a, b);
+  assert.ok(sim >= 0 && sim <= 1, `Expected [0,1], got ${sim}`);
 });
 
-test('InterestGraph.getNeighbors returns sorted-desc positive edges', () => {
-  const graph = new InterestGraph();
-  graph.addEdge('me', 'low', 1);
-  graph.addEdge('me', 'high', 9);
-  graph.addEdge('me', 'mid', 5);
-  const top = graph.getNeighbors('me', 2);
-  assert.equal(top.length, 2);
-  assert.equal(top[0]!.target, 'high');
-  assert.equal(top[1]!.target, 'mid');
+// ─── InterestGraph tests ──────────────────────────────────────────────────────
+
+test('InterestGraph recordSwipe like increases interest weight', () => {
+  const g = new InterestGraph();
+  g.recordSwipe('alice', 'bob', ['music', 'travel'], 'like');
+  const interests = g.getInterests('alice');
+  assert.ok(interests['music']! > 0);
+  assert.ok(interests['travel']! > 0);
 });
 
-test('InterestGraph.mutualMatches requires bidirectional edges above threshold', () => {
-  const graph = new InterestGraph({ mutualThreshold: 3 });
-  graph.addEdge('a', 'b', 5);
-  graph.addEdge('b', 'a', 4);
-  graph.addEdge('a', 'c', 5);
-  graph.addEdge('c', 'a', 2); // below threshold
-  const matches = graph.mutualMatches('a');
-  assert.deepEqual(matches.sort(), ['b']);
+test('InterestGraph recordSwipe superlike adds greater weight than like', () => {
+  const g = new InterestGraph();
+  g.recordSwipe('alice', 'bob', ['music'], 'superlike');
+  g.recordSwipe('alice', 'carol', ['travel'], 'like');
+  const interests = g.getInterests('alice');
+  assert.ok(interests['music']! > interests['travel']!);
 });
 
-test('InterestGraph.getRecommendations uses collaborative filtering', () => {
-  const graph = new InterestGraph({ positiveThreshold: 1 });
-  // Both `me` and `twin` like `X`, `Y`; `twin` additionally likes `Z`.
-  graph.addEdge('me', 'X', 5);
-  graph.addEdge('me', 'Y', 5);
-  graph.addEdge('twin', 'X', 5);
-  graph.addEdge('twin', 'Y', 5);
-  graph.addEdge('twin', 'Z', 8);
-  // An unrelated user also rates Z but shares nothing with `me`.
-  graph.addEdge('stranger', 'Z', 10);
-  graph.addEdge('stranger', 'W', 10);
-
-  const recs = graph.getRecommendations('me', 3);
-  assert.ok(recs.length > 0);
-  assert.equal(recs[0]!.userId, 'Z');
+test('InterestGraph recordSwipe skip reduces interest weight', () => {
+  const g = new InterestGraph();
+  g.recordSwipe('alice', 'bob', ['sports'], 'skip');
+  const interests = g.getInterests('alice');
+  assert.ok(interests['sports']! < 0);
 });
 
-test('InterestGraph.getRecommendations never recommends already-rated targets', () => {
-  const graph = new InterestGraph({ positiveThreshold: 1 });
-  graph.addEdge('me', 'X', 5);
-  graph.addEdge('peer', 'X', 5);
-  graph.addEdge('peer', 'Y', 5);
-  const recs = graph.getRecommendations('me', 5).map((r) => r.userId);
-  assert.ok(!recs.includes('X'));
-  assert.ok(recs.includes('Y'));
+test('InterestGraph getSimilarity returns 0 for users with no common interests', () => {
+  const g = new InterestGraph();
+  g.recordSwipe('alice', 'x', ['music'], 'like');
+  g.recordSwipe('bob', 'y', ['sports'], 'like');
+  assert.equal(g.getSimilarity('alice', 'bob'), 0);
 });
 
-test('InterestGraph serialises and restores losslessly', () => {
-  const graph = new InterestGraph();
-  graph.addEdge('a', 'b', 3);
-  graph.addEdge('a', 'c', 5);
-  const snap = graph.snapshot();
-
-  const reborn = new InterestGraph();
-  reborn.restore(snap);
-  assert.equal(reborn.edgeCount(), 2);
-  assert.equal(reborn.getEdge('a', 'c')?.weight, 5);
+test('InterestGraph getSimilarity returns >0 for users with shared interests', () => {
+  const g = new InterestGraph();
+  g.recordSwipe('alice', 'x', ['music', 'travel'], 'like');
+  g.recordSwipe('bob', 'y', ['music', 'travel'], 'like');
+  const sim = g.getSimilarity('alice', 'bob');
+  assert.ok(sim > 0, `Expected positive similarity, got ${sim}`);
 });
 
-test('SwipeProcessor → InterestGraph end-to-end: a like creates a positive edge', () => {
-  const glicko = new GlickoEngine();
-  const processor = new SwipeProcessor(glicko, {}, () => 0);
-  const graph = new InterestGraph();
-  processor.onCompatibility((sig) => graph.applySignal(sig));
+test('InterestGraph getRecommendations excludes self', () => {
+  const g = new InterestGraph();
+  g.recordSwipe('alice', 'target1', ['music'], 'like');
+  g.recordSwipe('alice', 'target2', ['travel'], 'like');
+  const recs = g.getRecommendations('alice', 10);
+  assert.ok(!recs.some((r) => r.userId === 'alice'), 'Self should not appear in recommendations');
+});
 
-  processor.process({
-    userId: 'alice',
-    targetId: 'bob',
-    action: 'like',
-    dwellTimeMs: 4000,
-    scrollVelocity: 50
-  });
+test('InterestGraph getRecommendations excludes already-swiped users', () => {
+  const g = new InterestGraph();
+  g.seedInterests('alice', { music: 5 });
+  g.recordSwipe('alice', 'bob', ['music'], 'like'); // alice already swiped bob
+  g.seedInterests('bob', { music: 8 });
 
-  const edge = graph.getEdge('alice', 'bob');
-  assert.ok(edge);
-  assert.ok(edge!.weight >= 3);
+  const recs = g.getRecommendations('alice', 10);
+  assert.ok(!recs.some((r) => r.userId === 'bob'), 'Already-swiped bob should not appear');
+});
+
+test('InterestGraph getRecommendations returns top-N sorted by similarity', () => {
+  const g = new InterestGraph();
+  g.seedInterests('alice', { music: 10, travel: 8 });
+  g.seedInterests('bob', { music: 9, travel: 7 }); // high similarity
+  g.seedInterests('carol', { sports: 10 });          // zero similarity
+
+  const recs = g.getRecommendations('alice', 2);
+  if (recs.length >= 2) {
+    assert.ok(recs[0]!.similarity >= recs[1]!.similarity, 'Results should be sorted by similarity');
+  }
+});
+
+test('InterestGraph getRecommendations respects count limit', () => {
+  const g = new InterestGraph();
+  for (let i = 0; i < 10; i++) {
+    g.seedInterests(`user${i}`, { music: i + 1 });
+  }
+  g.seedInterests('alice', { music: 5 });
+  const recs = g.getRecommendations('alice', 3);
+  assert.ok(recs.length <= 3);
+});
+
+test('InterestGraph seedInterests accumulates weights', () => {
+  const g = new InterestGraph();
+  g.seedInterests('alice', { music: 5 });
+  g.seedInterests('alice', { music: 3 });
+  const interests = g.getInterests('alice');
+  assert.equal(interests['music'], 8);
+});
+
+test('InterestGraph getAllUserIds lists known users', () => {
+  const g = new InterestGraph();
+  g.seedInterests('alice', { music: 1 });
+  g.seedInterests('bob', { travel: 1 });
+  const ids = g.getAllUserIds();
+  assert.ok(ids.includes('alice'));
+  assert.ok(ids.includes('bob'));
 });

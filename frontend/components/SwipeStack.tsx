@@ -1,340 +1,329 @@
 'use client';
 
-/**
- * SwipeStack — Framer-Motion powered, physics-based card stack.
- *
- * Interaction model (mobile-first, pointer events):
- *   - Horizontal drag right past `swipeThreshold` → LIKE.
- *   - Horizontal drag left past `-swipeThreshold` → SKIP.
- *   - Vertical drag up past `-verticalThreshold`  → SUPERLIKE.
- *   - Velocity-based completion: if velocity.x > 800 px/s the throw is
- *     accepted even when the displacement is below threshold.
- *   - Springs back to rest otherwise.
- *
- * Visuals:
- *   - The current card is on top.
- *   - The next 3 cards are stacked behind with a parallax (scale + Y offset).
- *   - A translucent gradient overlay colour-codes the active intent
- *     (green = like, red = skip, purple = superlike) as the user drags.
- *   - A small "ELO" badge, name label, and tag chips are rendered per card.
- *
- * Networking:
- *   - The component is deliberately dumb about transport. Parents pass a
- *     `onSwipe` callback that receives `{card, action, velocity, durationMs}`.
- *     A Fastify/WebSocket hook in the parent is responsible for calling
- *     `/api/swipe` or sending the swipe event down the match websocket.
- */
-
+import { useState, useRef } from 'react';
 import {
   motion,
   useMotionValue,
   useTransform,
-  useAnimationControls,
-  AnimatePresence,
+  useAnimation,
   PanInfo
 } from 'framer-motion';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-export type SwipeAction = 'like' | 'skip' | 'superlike';
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface SwipeCard {
+export interface CardData {
   id: string;
   name: string;
   age?: number;
-  elo: number;
-  tags: string[];
-  /** URL to a video stream or static poster image. */
-  mediaUrl: string;
-  /** If true, render as a looping muted video instead of an <img>. */
-  isVideo?: boolean;
-  /** Optional short bio shown under the tags. */
-  bio?: string;
+  eloRating?: number;
+  tags?: string[];
+  avatarUrl?: string;
+  /** Active WebRTC stream (if video is live). */
+  stream?: MediaStream;
 }
 
 export interface SwipeStackProps {
-  cards: SwipeCard[];
-  onSwipe: (event: SwipeEventPayload) => void;
+  cards: CardData[];
+  onLike?: (card: CardData) => void;
+  onSkip?: (card: CardData) => void;
+  onSuperlike?: (card: CardData) => void;
   onEmpty?: () => void;
-  /** Horizontal distance (px) after which a drag is accepted as like/skip. */
-  swipeThreshold?: number;
-  /** Vertical (upward) distance (px) after which a drag is accepted as superlike. */
-  verticalThreshold?: number;
-  /** Flick velocity (px/s) over which a drag is accepted below threshold. */
-  velocityThreshold?: number;
-  /** Number of stacked "behind" cards to render (0 = only current). */
-  visibleBehind?: number;
-  /** Optional rendering override per card. */
-  renderMeta?: (card: SwipeCard) => React.ReactNode;
 }
 
-export interface SwipeEventPayload {
-  card: SwipeCard;
-  action: SwipeAction;
-  velocity: { x: number; y: number };
-  durationMs: number;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function eloBadgeColor(elo?: number): string {
+  if (!elo) return '#888';
+  if (elo >= 1600) return '#a78bfa'; // diamond – violet
+  if (elo >= 1400) return '#38bdf8'; // platinum – sky
+  if (elo >= 1200) return '#fbbf24'; // gold
+  if (elo >= 1000) return '#9ca3af'; // silver
+  return '#b45309';                   // bronze
 }
 
-/** Helpers exported for unit testing the pure parts of the stack. */
-export function classifySwipe(
-  offset: { x: number; y: number },
-  velocity: { x: number; y: number },
-  thresholds: { x: number; y: number; v: number }
-): SwipeAction | null {
-  const dominantX = Math.abs(offset.x) >= Math.abs(offset.y);
-
-  if (!dominantX && offset.y < -thresholds.y) return 'superlike';
-  if (!dominantX && velocity.y < -thresholds.v) return 'superlike';
-
-  if (offset.x > thresholds.x) return 'like';
-  if (offset.x < -thresholds.x) return 'skip';
-
-  if (velocity.x > thresholds.v) return 'like';
-  if (velocity.x < -thresholds.v) return 'skip';
-
-  return null;
+function eloBracketLabel(elo?: number): string {
+  if (!elo) return '—';
+  if (elo >= 1600) return '💎 Diamond';
+  if (elo >= 1400) return '🌊 Platinum';
+  if (elo >= 1200) return '⭐ Gold';
+  if (elo >= 1000) return '🥈 Silver';
+  return '🥉 Bronze';
 }
 
-/** Pure geometry — next-card parallax transform values. */
-export function parallaxTransform(depth: number): { scale: number; y: number; opacity: number } {
-  // depth = 0 is the active card, 1 is directly behind, etc.
-  if (depth <= 0) return { scale: 1, y: 0, opacity: 1 };
-  return {
-    scale: Math.max(0.85, 1 - depth * 0.05),
-    y: depth * 14,
-    opacity: Math.max(0.4, 1 - depth * 0.25)
-  };
-}
+// ─── VideoCard ────────────────────────────────────────────────────────────────
 
-const DEFAULT_THRESHOLDS = {
-  swipeThreshold: 120,
-  verticalThreshold: 140,
-  velocityThreshold: 800,
-  visibleBehind: 3
-};
+function VideoCard({ card }: { card: CardData }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
 
-export default function SwipeStack({
-  cards,
-  onSwipe,
-  onEmpty,
-  swipeThreshold = DEFAULT_THRESHOLDS.swipeThreshold,
-  verticalThreshold = DEFAULT_THRESHOLDS.verticalThreshold,
-  velocityThreshold = DEFAULT_THRESHOLDS.velocityThreshold,
-  visibleBehind = DEFAULT_THRESHOLDS.visibleBehind,
-  renderMeta
-}: SwipeStackProps) {
-  const [index, setIndex] = useState(0);
-  const activeCard = cards[index];
-  const startedAtRef = useRef<number>(performance.now());
-
-  useEffect(() => {
-    startedAtRef.current = performance.now();
-  }, [index]);
-
-  useEffect(() => {
-    if (!activeCard && onEmpty) onEmpty();
-  }, [activeCard, onEmpty]);
-
-  const completeSwipe = useCallback(
-    (action: SwipeAction, velocity: { x: number; y: number }) => {
-      if (!activeCard) return;
-      const durationMs = performance.now() - startedAtRef.current;
-      onSwipe({ card: activeCard, action, velocity, durationMs });
-      setIndex((i) => i + 1);
-    },
-    [activeCard, onSwipe]
-  );
-
-  const behind = useMemo(() => cards.slice(index + 1, index + 1 + visibleBehind), [
-    cards,
-    index,
-    visibleBehind
-  ]);
+  // Attach MediaStream when the element mounts.
+  if (videoRef.current && card.stream) {
+    videoRef.current.srcObject = card.stream;
+  }
 
   return (
-    <div className="relative h-[640px] w-full max-w-[380px] mx-auto select-none">
-      {/* Behind-stack cards (rendered bottom-up so z-order is correct) */}
-      {behind
-        .map((card, i) => ({ card, depth: behind.length - i }))
-        .reverse()
-        .map(({ card, depth }) => (
-          <StaticStackCard key={card.id} card={card} depth={depth} renderMeta={renderMeta} />
-        ))}
-
-      <AnimatePresence initial={false}>
-        {activeCard && (
-          <ActiveCard
-            key={activeCard.id}
-            card={activeCard}
-            thresholds={{
-              x: swipeThreshold,
-              y: verticalThreshold,
-              v: velocityThreshold
-            }}
-            onComplete={completeSwipe}
-            renderMeta={renderMeta}
-          />
-        )}
-      </AnimatePresence>
-
-      {!activeCard && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center text-center text-white/60">
-          <span className="text-sm tracking-widest">QUEUE EMPTY</span>
-          <span className="mt-2 text-xs text-white/40">
-            Keep scrolling — fresh candidates arriving shortly.
-          </span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-interface ActiveCardProps {
-  card: SwipeCard;
-  thresholds: { x: number; y: number; v: number };
-  onComplete: (action: SwipeAction, velocity: { x: number; y: number }) => void;
-  renderMeta?: (card: SwipeCard) => React.ReactNode;
-}
-
-function ActiveCard({ card, thresholds, onComplete, renderMeta }: ActiveCardProps) {
-  const x = useMotionValue(0);
-  const y = useMotionValue(0);
-  const rotate = useTransform(x, [-200, 0, 200], [-14, 0, 14]);
-  const likeOpacity = useTransform(x, [40, thresholds.x], [0, 1]);
-  const skipOpacity = useTransform(x, [-thresholds.x, -40], [1, 0]);
-  const superOpacity = useTransform(y, [-thresholds.y, -40], [1, 0]);
-  const controls = useAnimationControls();
-
-  const handleDragEnd = async (_: unknown, info: PanInfo) => {
-    const action = classifySwipe(info.offset, info.velocity, thresholds);
-    if (action === 'like' || action === 'superlike') {
-      await controls.start({
-        x: action === 'like' ? 800 : 0,
-        y: action === 'superlike' ? -900 : 0,
-        opacity: 0,
-        transition: { duration: 0.35, ease: [0.19, 1, 0.22, 1] }
-      });
-      onComplete(action, info.velocity);
-      return;
-    }
-    if (action === 'skip') {
-      await controls.start({
-        x: -800,
-        opacity: 0,
-        transition: { duration: 0.35, ease: [0.19, 1, 0.22, 1] }
-      });
-      onComplete('skip', info.velocity);
-      return;
-    }
-    // No decision — spring back.
-    void controls.start({
-      x: 0,
-      y: 0,
-      transition: { type: 'spring', stiffness: 380, damping: 28 }
-    });
-  };
-
-  return (
-    <motion.div
-      drag
-      dragElastic={0.6}
-      dragMomentum={false}
-      style={{ x, y, rotate }}
-      animate={controls}
-      initial={{ scale: 0.95, opacity: 0 }}
-      whileInView={{ scale: 1, opacity: 1 }}
-      onDragEnd={handleDragEnd}
-      className="absolute inset-0 cursor-grab active:cursor-grabbing"
-    >
-      <CardSurface card={card} renderMeta={renderMeta}>
-        <motion.div
-          aria-hidden
-          style={{ opacity: likeOpacity }}
-          className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-br from-emerald-500/40 via-transparent to-transparent"
-        />
-        <motion.div
-          aria-hidden
-          style={{ opacity: skipOpacity }}
-          className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-br from-rose-500/40 via-transparent to-transparent"
-        />
-        <motion.div
-          aria-hidden
-          style={{ opacity: superOpacity }}
-          className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-t from-fuchsia-500/40 via-transparent to-transparent"
-        />
-      </CardSurface>
-    </motion.div>
-  );
-}
-
-interface StaticCardProps {
-  card: SwipeCard;
-  depth: number;
-  renderMeta?: (card: SwipeCard) => React.ReactNode;
-}
-
-function StaticStackCard({ card, depth, renderMeta }: StaticCardProps) {
-  const { scale, y, opacity } = parallaxTransform(depth);
-  return (
-    <motion.div
-      style={{ scale, y, opacity }}
-      aria-hidden
-      className="absolute inset-0 pointer-events-none"
-    >
-      <CardSurface card={card} renderMeta={renderMeta} />
-    </motion.div>
-  );
-}
-
-interface CardSurfaceProps {
-  card: SwipeCard;
-  children?: React.ReactNode;
-  renderMeta?: (card: SwipeCard) => React.ReactNode;
-}
-
-function CardSurface({ card, children, renderMeta }: CardSurfaceProps) {
-  return (
-    <div className="relative h-full w-full overflow-hidden rounded-2xl border border-white/10 bg-black shadow-2xl shadow-black/50">
-      {card.isVideo ? (
+    <div className="relative w-full h-full rounded-3xl overflow-hidden bg-gray-900 select-none">
+      {card.stream ? (
         <video
-          src={card.mediaUrl}
-          className="h-full w-full object-cover"
+          ref={videoRef}
           autoPlay
           muted
-          loop
           playsInline
+          className="absolute inset-0 w-full h-full object-cover"
         />
       ) : (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={card.mediaUrl} alt={card.name} className="h-full w-full object-cover" />
+        <div className="absolute inset-0 flex items-center justify-center">
+          {card.avatarUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={card.avatarUrl}
+              alt={card.name}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <div className="text-6xl">👤</div>
+          )}
+        </div>
       )}
 
-      <div className="absolute inset-x-0 bottom-0 flex flex-col gap-2 bg-gradient-to-t from-black/85 via-black/50 to-transparent p-5 text-white">
-        <div className="flex items-center justify-between">
-          <h3 className="text-xl font-semibold tracking-wide">
-            {card.name}
-            {typeof card.age === 'number' ? <span className="ml-2 font-light">{card.age}</span> : null}
-          </h3>
-          <span className="rounded-full border border-white/20 bg-white/10 px-3 py-0.5 text-xs tracking-widest">
-            ELO {Math.round(card.elo)}
-          </span>
+      {/* Gradient overlay */}
+      <div className="absolute inset-x-0 bottom-0 h-40 bg-gradient-to-t from-black/80 to-transparent" />
+
+      {/* Name & ELO */}
+      <div className="absolute bottom-4 left-4 right-4">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-white text-2xl font-bold">{card.name}</span>
+          {card.age && (
+            <span className="text-white/70 text-lg">{card.age}</span>
+          )}
         </div>
-        {card.bio ? <p className="text-xs text-white/70">{card.bio}</p> : null}
-        {card.tags.length > 0 ? (
-          <div className="flex flex-wrap gap-1.5">
-            {card.tags.map((tag) => (
+
+        <div
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold"
+          style={{ backgroundColor: eloBadgeColor(card.eloRating) + '33', color: eloBadgeColor(card.eloRating) }}
+        >
+          {eloBracketLabel(card.eloRating)}
+          {card.eloRating && <span className="opacity-70 ml-1">({card.eloRating})</span>}
+        </div>
+
+        {card.tags && card.tags.length > 0 && (
+          <div className="flex flex-wrap gap-1 mt-2">
+            {card.tags.slice(0, 4).map((tag) => (
               <span
                 key={tag}
-                className="rounded-full border border-white/10 bg-white/10 px-2.5 py-0.5 text-[11px] uppercase tracking-wider text-white/80"
+                className="px-2 py-0.5 rounded-full text-xs bg-white/10 text-white/80 backdrop-blur-sm"
               >
                 {tag}
               </span>
             ))}
           </div>
-        ) : null}
-        {renderMeta ? renderMeta(card) : null}
+        )}
       </div>
+    </div>
+  );
+}
 
-      {children}
+// ─── SwipeCard (individual draggable card) ────────────────────────────────────
+
+interface SwipeCardProps {
+  card: CardData;
+  stackIndex: number; // 0 = top, 1, 2 = behind
+  total: number;
+  onLike: (card: CardData, velocity: number) => void;
+  onSkip: (card: CardData, velocity: number) => void;
+  onSuperlike: (card: CardData, velocity: number) => void;
+}
+
+function SwipeCard({ card, stackIndex, onLike, onSkip, onSuperlike }: SwipeCardProps) {
+  const x = useMotionValue(0);
+  const y = useMotionValue(0);
+  const controls = useAnimation();
+
+  const rotate = useTransform(x, [-200, 0, 200], [-18, 0, 18]);
+  const likeOpacity = useTransform(x, [30, 120], [0, 1]);
+  const skipOpacity = useTransform(x, [-120, -30], [1, 0]);
+  const superlikeOpacity = useTransform(y, [-120, -40], [1, 0]);
+
+  const isTop = stackIndex === 0;
+
+  // Parallax: cards behind the top are scaled down and shifted up slightly.
+  const scale = 1 - stackIndex * 0.045;
+  const translateY = stackIndex * -12;
+
+  async function handleDragEnd(_: unknown, info: PanInfo) {
+    const velocityX = info.velocity.x;
+    const velocityY = info.velocity.y;
+    const offsetX = info.offset.x;
+    const offsetY = info.offset.y;
+
+    const SWIPE_THRESHOLD_X = 100;
+    const SWIPE_THRESHOLD_Y = -100;
+    const VELOCITY_THRESHOLD = 500;
+
+    if (offsetY < SWIPE_THRESHOLD_Y || velocityY < -VELOCITY_THRESHOLD) {
+      // Swipe up = superlike.
+      await controls.start({ y: -600, opacity: 0, transition: { duration: 0.35 } });
+      onSuperlike(card, Math.abs(velocityY));
+    } else if (offsetX > SWIPE_THRESHOLD_X || velocityX > VELOCITY_THRESHOLD) {
+      // Swipe right = like.
+      await controls.start({ x: 600, rotate: 20, opacity: 0, transition: { duration: 0.35 } });
+      onLike(card, velocityX);
+    } else if (offsetX < -SWIPE_THRESHOLD_X || velocityX < -VELOCITY_THRESHOLD) {
+      // Swipe left = skip.
+      await controls.start({ x: -600, rotate: -20, opacity: 0, transition: { duration: 0.35 } });
+      onSkip(card, Math.abs(velocityX));
+    } else {
+      // Snap back.
+      await controls.start({ x: 0, y: 0, rotate: 0, transition: { type: 'spring', stiffness: 300, damping: 20 } });
+    }
+  }
+
+  return (
+    <motion.div
+      className="absolute inset-0"
+      style={{
+        x: isTop ? x : 0,
+        y: isTop ? y : translateY,
+        rotate: isTop ? rotate : 0,
+        scale,
+        zIndex: 10 - stackIndex
+      }}
+      animate={isTop ? controls : { scale, y: translateY }}
+      transition={{ type: 'spring', stiffness: 260, damping: 20 }}
+      drag={isTop ? true : false}
+      dragConstraints={{ left: -300, right: 300, top: -300, bottom: 100 }}
+      dragElastic={0.15}
+      onDragEnd={isTop ? handleDragEnd : undefined}
+    >
+      {/* Swipe direction overlays (only on top card) */}
+      {isTop && (
+        <>
+          <motion.div
+            className="absolute top-8 left-6 z-20 px-4 py-1.5 rounded-xl border-4 border-green-400 text-green-400 font-black text-2xl tracking-widest rotate-[-20deg]"
+            style={{ opacity: likeOpacity }}
+          >
+            LIKE
+          </motion.div>
+          <motion.div
+            className="absolute top-8 right-6 z-20 px-4 py-1.5 rounded-xl border-4 border-red-400 text-red-400 font-black text-2xl tracking-widest rotate-[20deg]"
+            style={{ opacity: skipOpacity }}
+          >
+            NOPE
+          </motion.div>
+          <motion.div
+            className="absolute top-8 left-1/2 -translate-x-1/2 z-20 px-4 py-1.5 rounded-xl border-4 border-yellow-400 text-yellow-400 font-black text-2xl tracking-widest"
+            style={{ opacity: superlikeOpacity }}
+          >
+            SUPER ⭐
+          </motion.div>
+        </>
+      )}
+
+      <VideoCard card={card} />
+    </motion.div>
+  );
+}
+
+// ─── SwipeStack ───────────────────────────────────────────────────────────────
+
+export default function SwipeStack({
+  cards: initialCards,
+  onLike,
+  onSkip,
+  onSuperlike,
+  onEmpty
+}: SwipeStackProps) {
+  const [cards, setCards] = useState<CardData[]>(initialCards);
+  const dwellStart = useRef<number>(Date.now());
+
+  const topCard = cards[0];
+  const visibleCards = cards.slice(0, 3);
+
+  function removeTopCard() {
+    setCards((prev) => {
+      const next = prev.slice(1);
+      if (next.length === 0) onEmpty?.();
+      return next;
+    });
+    dwellStart.current = Date.now();
+  }
+
+  function handleLike(card: CardData, velocity: number) {
+    const dwellTimeMs = Date.now() - dwellStart.current;
+    onLike?.({ ...card });
+    console.debug('like', card.id, { dwellTimeMs, velocity });
+    removeTopCard();
+  }
+
+  function handleSkip(card: CardData, velocity: number) {
+    const dwellTimeMs = Date.now() - dwellStart.current;
+    onSkip?.({ ...card });
+    console.debug('skip', card.id, { dwellTimeMs, velocity });
+    removeTopCard();
+  }
+
+  function handleSuperlike(card: CardData, velocity: number) {
+    const dwellTimeMs = Date.now() - dwellStart.current;
+    onSuperlike?.({ ...card });
+    console.debug('superlike', card.id, { dwellTimeMs, velocity });
+    removeTopCard();
+  }
+
+  if (!topCard) {
+    return (
+      <div className="flex items-center justify-center w-full h-full">
+        <p className="text-white/50 text-lg">No more cards 🎉</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative w-full h-full" style={{ perspective: 1000 }}>
+      {/* Render up to 3 stacked cards, bottom to top */}
+      {[...visibleCards].reverse().map((card, reversedIdx) => {
+        const stackIndex = visibleCards.length - 1 - reversedIdx;
+        return (
+          <SwipeCard
+            key={card.id}
+            card={card}
+            stackIndex={stackIndex}
+            total={visibleCards.length}
+            onLike={handleLike}
+            onSkip={handleSkip}
+            onSuperlike={handleSuperlike}
+          />
+        );
+      })}
+
+      {/* Action buttons */}
+      <div className="absolute -bottom-16 inset-x-0 flex justify-center items-center gap-6 z-30">
+        <motion.button
+          whileHover={{ scale: 1.1 }}
+          whileTap={{ scale: 0.9 }}
+          onClick={() => handleSkip(topCard, 0)}
+          className="w-14 h-14 rounded-full bg-white/10 border border-white/20 text-2xl flex items-center justify-center shadow-lg backdrop-blur-sm"
+          aria-label="Skip"
+        >
+          ✕
+        </motion.button>
+        <motion.button
+          whileHover={{ scale: 1.15 }}
+          whileTap={{ scale: 0.85 }}
+          onClick={() => handleSuperlike(topCard, 0)}
+          className="w-12 h-12 rounded-full bg-yellow-400/20 border border-yellow-400/50 text-xl flex items-center justify-center shadow-lg backdrop-blur-sm"
+          aria-label="Superlike"
+        >
+          ⭐
+        </motion.button>
+        <motion.button
+          whileHover={{ scale: 1.1 }}
+          whileTap={{ scale: 0.9 }}
+          onClick={() => handleLike(topCard, 0)}
+          className="w-14 h-14 rounded-full bg-green-500/20 border border-green-500/50 text-2xl flex items-center justify-center shadow-lg backdrop-blur-sm"
+          aria-label="Like"
+        >
+          ♥
+        </motion.button>
+      </div>
     </div>
   );
 }
