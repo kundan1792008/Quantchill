@@ -6,6 +6,8 @@ import { BiometricHandshakeService, BiometricPayload } from './services/Biometri
 import { MatchMaker, UserProfile, BCIContext } from './services/MatchMaker';
 import { MoodEngine, MoodName } from './services/MoodEngine';
 import { SessionTracker } from './services/SessionTracker';
+import { EloRatingService, SwipeOutcome } from './services/EloRatingService';
+import { HiveMindAlgorithm } from './services/HiveMindAlgorithm';
 
 type SocketMessage =
   | { type: 'register'; userId: string; interestGraph: Record<string, number>; bciContext?: BCIContext }
@@ -14,6 +16,7 @@ type SocketMessage =
   | { type: 'biometric-handshake'; payload: BiometricPayload }
   | { type: 'biometric-update'; payload: BiometricPayload }
   | { type: 'match-request'; bciContext: BCIContext }
+  | { type: 'swipe'; subjectUserId: string; outcome: SwipeOutcome; featureKey?: string }
   | { type: 'ping'; sentAt?: number };
 
 interface ClientState {
@@ -25,7 +28,9 @@ interface ClientState {
 
 const app = Fastify({ logger: true });
 const handshakeService = new BiometricHandshakeService();
-const matchMaker = new MatchMaker();
+const hiveMind = new HiveMindAlgorithm();
+const matchMaker = new MatchMaker(40, hiveMind);
+const eloService = new EloRatingService();
 const sessionTracker = new SessionTracker();
 /** Per-session MoodEngine instances to avoid shared mutable state. */
 const sessionEngines = new Map<string, MoodEngine>();
@@ -50,9 +55,63 @@ function getSessionEngine(sessionId: string): MoodEngine | null {
   return sessionEngines.get(sessionId) ?? null;
 }
 
+/** Sync the latest ELO record from the service into a UserProfile copy. */
+function syncEloToProfile(profile: UserProfile): UserProfile {
+  const elo = eloService.getRecord(profile.id);
+  return { ...profile, eloRating: elo.rating, interactionCount: elo.interactionCount };
+}
+
 app.register(websocket);
 
 app.get('/health', async () => ({ status: 'ok' }));
+
+// ─── ELO REST routes ─────────────────────────────────────────────────────────
+
+/**
+ * High-frequency swipe event ingestion endpoint.
+ *
+ * Designed to be placed behind a load balancer for batch throughput;
+ * a Redis-backed EloRatingService can replace the in-memory store for
+ * horizontal scaling to 100 k+ events per second.
+ *
+ * POST /elo/swipe
+ * Body: { viewerId, subjectId, outcome: 'skip' | 'hold', featureKey?: string }
+ */
+app.post<{
+  Body: { viewerId: string; subjectId: string; outcome: SwipeOutcome; featureKey?: string };
+}>('/elo/swipe', async (request, reply) => {
+  const { viewerId, subjectId, outcome, featureKey } = request.body;
+
+  if (!viewerId || !subjectId || (outcome !== 'skip' && outcome !== 'hold')) {
+    return reply.status(400).send({ error: 'viewerId, subjectId and outcome (skip|hold) are required' });
+  }
+
+  if (viewerId === subjectId) {
+    return reply.status(400).send({ error: 'cannot swipe on self' });
+  }
+
+  const result = eloService.processSwipe(viewerId, subjectId, outcome);
+
+  if (featureKey) {
+    const reward = outcome === 'hold' ? 1 : -1;
+    hiveMind.reinforce({ featureKey, reward });
+  }
+
+  return {
+    viewerElo: result.viewerElo,
+    subjectElo: result.subjectElo,
+    outcome: result.outcome
+  };
+});
+
+/** Return the ELO record (rating + bracket + interaction count) for a user. */
+app.get<{ Params: { userId: string } }>('/elo/:userId', async (request, reply) => {
+  const { userId } = request.params;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+
+  const record = eloService.getRecord(userId);
+  return { ...record, bracket: eloService.getBracket(userId) };
+});
 
 // ─── Mood Engine REST routes ─────────────────────────────────────────────────
 
@@ -219,9 +278,12 @@ app.get('/ws', { websocket: true }, (socket) => {
     }
 
     if (message.type === 'register') {
+      const eloRecord = eloService.getRecord(message.userId);
       currentClient.profile = {
         id: message.userId,
-        interestGraph: message.interestGraph
+        interestGraph: message.interestGraph,
+        eloRating: eloRecord.rating,
+        interactionCount: eloRecord.interactionCount
       };
 
       sendSafe(socket, { type: 'registered', userId: message.userId });
@@ -234,15 +296,48 @@ app.get('/ws', { websocket: true }, (socket) => {
         return;
       }
 
+      // Sync latest ELO into the profile before ranking.
+      currentClient.profile = syncEloToProfile(currentClient.profile);
+
       const candidates = Array.from(clients.values())
         .filter((client) => client.authenticated && client.profile)
-        .map((client) => client.profile as UserProfile);
+        .map((client) => syncEloToProfile(client.profile as UserProfile));
 
       const ranked = matchMaker.rankCandidates(currentClient.profile, candidates, message.bciContext);
       sendSafe(socket, {
         type: 'match-response',
         transitionLoop: matchMaker.shouldTransitionLoop(message.bciContext),
         candidates: ranked.slice(0, 5)
+      });
+      return;
+    }
+
+    if (message.type === 'swipe') {
+      if (!currentClient.profile) {
+        sendSafe(socket, { type: 'error', message: 'register-required' });
+        return;
+      }
+
+      if (currentClient.profile.id === message.subjectUserId) {
+        sendSafe(socket, { type: 'error', message: 'cannot swipe on self' });
+        return;
+      }
+
+      const result = eloService.processSwipe(currentClient.profile.id, message.subjectUserId, message.outcome);
+
+      // Feed the outcome into the HiveMind reinforcement loop so that the
+      // interest-graph weights converge toward features that hold attention.
+      if (message.featureKey) {
+        const reward = message.outcome === 'hold' ? 1 : -1;
+        hiveMind.reinforce({ featureKey: message.featureKey, reward });
+      }
+
+      sendSafe(socket, {
+        type: 'swipe-ack',
+        outcome: result.outcome,
+        viewerElo: result.viewerElo.rating,
+        subjectElo: result.subjectElo.rating,
+        processedAt: Date.now()
       });
       return;
     }
