@@ -8,6 +8,9 @@ import { MoodEngine, MoodName } from './services/MoodEngine';
 import { SessionTracker } from './services/SessionTracker';
 import { EloRatingService, SwipeOutcome } from './services/EloRatingService';
 import { HiveMindAlgorithm } from './services/HiveMindAlgorithm';
+import { SwipeProcessor, type SwipeEvent } from './services/SwipeProcessor';
+import { InterestGraph } from './services/InterestGraph';
+import { EloService } from './services/EloService';
 
 type SocketMessage =
   | { type: 'register'; userId: string; interestGraph: Record<string, number>; bciContext?: BCIContext }
@@ -31,10 +34,19 @@ const handshakeService = new BiometricHandshakeService();
 const hiveMind = new HiveMindAlgorithm();
 const matchMaker = new MatchMaker(40, hiveMind);
 const eloService = new EloRatingService();
+const glicko2Service = new EloService();
+const interestGraph = new InterestGraph();
+const swipeProcessor = new SwipeProcessor(glicko2Service);
 const sessionTracker = new SessionTracker();
 /** Per-session MoodEngine instances to avoid shared mutable state. */
 const sessionEngines = new Map<string, MoodEngine>();
 const clients = new Map<string, ClientState>();
+/** userId → Set of matched userIds (mutual likes). */
+const mutualMatches = new Map<string, Set<string>>();
+/** userId → report count. Auto-ban after 3 reports. */
+const reportCounts = new Map<string, number>();
+/** Set of banned userIds. */
+const bannedUsers = new Set<string>();
 
 function sendSafe(socket: WebSocket, payload: unknown): void {
   if (socket.readyState === socket.OPEN) {
@@ -111,6 +123,139 @@ app.get<{ Params: { userId: string } }>('/elo/:userId', async (request, reply) =
 
   const record = eloService.getRecord(userId);
   return { ...record, bracket: eloService.getBracket(userId) };
+});
+
+// ─── Swipe / Match / Report REST routes ──────────────────────────────────────
+
+/**
+ * POST /api/swipe
+ * Process a rich swipe event (like | skip | superlike) and return updated ELO.
+ * Body: { userId, targetId, action, dwellTimeMs, scrollVelocity, interests? }
+ */
+app.post<{
+  Body: {
+    userId: string;
+    targetId: string;
+    action: 'like' | 'skip' | 'superlike';
+    dwellTimeMs: number;
+    scrollVelocity: number;
+    interests?: string[];
+  };
+}>('/api/swipe', async (request, reply) => {
+  const { userId, targetId, action, dwellTimeMs, scrollVelocity, interests = [] } = request.body;
+
+  if (!userId || !targetId || !action) {
+    return reply.status(400).send({ error: 'userId, targetId and action are required' });
+  }
+
+  if (!['like', 'skip', 'superlike'].includes(action)) {
+    return reply.status(400).send({ error: 'action must be like | skip | superlike' });
+  }
+
+  if (userId === targetId) {
+    return reply.status(400).send({ error: 'cannot swipe on self' });
+  }
+
+  if (bannedUsers.has(userId)) {
+    return reply.status(403).send({ error: 'account-banned' });
+  }
+
+  const event: SwipeEvent = { userId, targetId, action, dwellTimeMs, scrollVelocity };
+  const result = swipeProcessor.process(event);
+
+  // Update interest graph based on swipe outcome.
+  if (interests.length > 0) {
+    interestGraph.recordSwipe(userId, targetId, interests, action);
+  }
+
+  // Detect mutual match (like or superlike from both parties).
+  if (action !== 'skip') {
+    const targetLikes = mutualMatches.get(targetId);
+    if (targetLikes?.has(userId)) {
+      // Mutual match detected – emit via events if listeners are attached.
+      app.log.info({ userId, targetId }, 'mutual-match');
+    } else {
+      const userLikes = mutualMatches.get(userId) ?? new Set<string>();
+      userLikes.add(targetId);
+      mutualMatches.set(userId, userLikes);
+    }
+  }
+
+  return {
+    userRating: result.userRating,
+    targetRating: result.targetRating,
+    compatibilityDelta: result.compatibilityDelta,
+    cooldownApplied: result.cooldownApplied,
+    processedAt: result.processedAt
+  };
+});
+
+/**
+ * GET /api/matches
+ * Return the list of mutual matches for a user.
+ * Query: { userId }
+ */
+app.get<{ Querystring: { userId: string } }>('/api/matches', async (request, reply) => {
+  const { userId } = request.query;
+  if (!userId) return reply.status(400).send({ error: 'userId query param is required' });
+
+  const userLikes = mutualMatches.get(userId) ?? new Set<string>();
+  const matches: string[] = [];
+
+  for (const otherId of userLikes) {
+    const otherLikes = mutualMatches.get(otherId);
+    if (otherLikes?.has(userId)) {
+      matches.push(otherId);
+    }
+  }
+
+  return { userId, matches };
+});
+
+/**
+ * GET /api/recommendations
+ * Return AI-ranked candidate list for a user using the interest graph.
+ * Query: { userId, count? }
+ */
+app.get<{ Querystring: { userId: string; count?: string } }>('/api/recommendations', async (request, reply) => {
+  const { userId, count = '10' } = request.query;
+  if (!userId) return reply.status(400).send({ error: 'userId query param is required' });
+
+  const n = Math.min(100, Math.max(1, parseInt(count, 10) || 10));
+  const recommendations = interestGraph.getRecommendations(userId, n);
+
+  return { userId, recommendations };
+});
+
+/**
+ * POST /api/report
+ * Report a user. Auto-bans after 3 reports.
+ * Body: { reporterId, reportedId, reason? }
+ */
+app.post<{
+  Body: { reporterId: string; reportedId: string; reason?: string };
+}>('/api/report', async (request, reply) => {
+  const { reporterId, reportedId, reason } = request.body;
+
+  if (!reporterId || !reportedId) {
+    return reply.status(400).send({ error: 'reporterId and reportedId are required' });
+  }
+
+  if (reporterId === reportedId) {
+    return reply.status(400).send({ error: 'cannot report self' });
+  }
+
+  const count = (reportCounts.get(reportedId) ?? 0) + 1;
+  reportCounts.set(reportedId, count);
+
+  const autoBanned = count >= 3;
+  if (autoBanned) {
+    bannedUsers.add(reportedId);
+  }
+
+  app.log.info({ reporterId, reportedId, reason, count, autoBanned }, 'user-reported');
+
+  return { reportedId, reportCount: count, autoBanned };
 });
 
 // ─── Mood Engine REST routes ─────────────────────────────────────────────────
