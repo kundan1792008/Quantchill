@@ -2,10 +2,8 @@
  * EloRatingService – dynamic K-factor ELO rating system for Quantchill matchmaking.
  *
  * Swipe outcomes feed directly into each user's ELO rating:
- *   - "skip"  → the skipped user suffers a loss (S = 0), the viewer gains a draw
- *               (S = 0.5) to prevent rating inflation.
- *   - "hold"  → the subject who held attention gains a win (S = 1); the viewer
- *               also gains a win (S = 1).
+ *   - "skip"  → the skipped user suffers a loss (S = 0), the skipper gains a marginal win (S = 1).
+ *   - "hold"  → the user who held attention gains a win; the viewer gains a marginal win too.
  *
  * K-factor scales down as a user accumulates more interactions (provisional → established).
  */
@@ -16,18 +14,21 @@ export type SwipeOutcome = 'skip' | 'hold';
 /** Per-user ELO state persisted in the in-memory store. */
 export interface EloRecord {
   userId: string;
+  /** Current ELO rating; default starting value is 1000. */
   rating: number;
+  /** Total number of rated interactions used to compute dynamic K-factor. */
   interactionCount: number;
 }
 
 /** Result returned after processing a single swipe event. */
 export interface SwipeResult {
-  subjectId: string;
   viewerId: string;
-  subjectNewRating: number;
-  viewerNewRating: number;
-  subjectDelta: number;
-  viewerDelta: number;
+  subjectId: string;
+  outcome: SwipeOutcome;
+  /** Updated ELO record for the subject (whose rating changed most). */
+  subjectElo: EloRecord;
+  /** Updated ELO record for the viewer. */
+  viewerElo: EloRecord;
 }
 
 /** Named ELO brackets used for peer discovery. */
@@ -133,40 +134,57 @@ export class EloRatingService {
    * Process a single swipe event and update both parties' ELO ratings.
    *
    * Outcome mapping:
-   *   - 'skip' : subject loses (S_subject = 0), viewer draws (S_viewer = 0.5)
-   *   - 'hold' : subject wins (S_subject = 1),  viewer wins  (S_viewer = 1)
+   *   - 'skip' : subject loses (S_subject = 0), viewer wins (S_viewer = 1)
+   *   - 'hold' : subject wins (S_subject = 1), viewer wins (S_viewer = 1)
+   *
+   * Both parties' interaction counts are incremented by 1 per swipe event.
+   *
+   * @param viewerId   User who performed the swipe.
+   * @param subjectId  User who was swiped on (shown on screen).
+   * @param outcome    'skip' or 'hold'.
+   * @returns          Updated ELO records for both parties.
    */
   processSwipe(viewerId: string, subjectId: string, outcome: SwipeOutcome): SwipeResult {
     const viewer = this.getRecord(viewerId);
     const subject = this.getRecord(subjectId);
 
-    const vK = getDynamicKFactor(viewer.interactionCount);
-    const sK = getDynamicKFactor(subject.interactionCount);
+    const eViewer = expectedScore(viewer.rating, subject.rating);
+    const eSubject = expectedScore(subject.rating, viewer.rating);
 
-    const viewerActual = outcome === 'skip' ? 0.5 : 1;
-    const subjectActual = outcome === 'skip' ? 0 : 1;
+    const kViewer = getDynamicKFactor(viewer.interactionCount);
+    const kSubject = getDynamicKFactor(subject.interactionCount);
 
-    const viewerExpected = expectedScore(viewer.rating, subject.rating);
-    const subjectExpected = expectedScore(subject.rating, viewer.rating);
+    // 'hold': both parties win (S=1) – mutual engagement is rewarded.
+    // 'skip': the subject loses (S=0); the viewer draws (S=0.5) – no credit
+    //         for skipping, preventing systematic upward rating drift.
+    const sViewer = outcome === 'hold' ? 1 : 0.5;
+    const sSubject = outcome === 'hold' ? 1 : 0;
 
-    const viewerNewRating = computeNewRating(viewer.rating, vK, viewerActual, viewerExpected);
-    const subjectNewRating = computeNewRating(subject.rating, sK, subjectActual, subjectExpected);
+    viewer.rating = computeNewRating(viewer.rating, kViewer, sViewer, eViewer);
+    subject.rating = computeNewRating(subject.rating, kSubject, sSubject, eSubject);
 
-    const viewerDelta = viewerNewRating - viewer.rating;
-    const subjectDelta = subjectNewRating - subject.rating;
-
-    viewer.rating = viewerNewRating;
     viewer.interactionCount += 1;
-    subject.rating = subjectNewRating;
     subject.interactionCount += 1;
 
     return {
-      subjectId,
       viewerId,
-      subjectNewRating,
-      viewerNewRating,
-      subjectDelta,
-      viewerDelta
+      subjectId,
+      outcome,
+      subjectElo: { ...subject },
+      viewerElo: { ...viewer }
     };
+  }
+
+  /**
+   * Return all stored ELO records (snapshot copy).
+   * Useful for bulk reads when seeding a Redis mirror on startup.
+   */
+  getAllRecords(): EloRecord[] {
+    return Array.from(this.store.values()).map((r) => ({ ...r }));
+  }
+
+  /** Seed an ELO record (e.g., loaded from a persistent store). */
+  seedRecord(record: EloRecord): void {
+    this.store.set(record.userId, { ...record });
   }
 }
