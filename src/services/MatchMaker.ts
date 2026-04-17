@@ -1,4 +1,5 @@
 import { HiveMindAlgorithm, SentimentArray } from './HiveMindAlgorithm';
+import { sameBracket } from './EloRatingService';
 
 export interface InterestGraph {
   [interest: string]: number;
@@ -7,6 +8,10 @@ export interface InterestGraph {
 export interface UserProfile {
   id: string;
   interestGraph: InterestGraph;
+  /** Current ELO rating; used for same-bracket peer discovery. Default: 1000. */
+  eloRating?: number;
+  /** Total rated interactions; determines dynamic K-factor. */
+  interactionCount?: number;
   quantsinkFeed?: {
     feedId: string;
     isVip: boolean;
@@ -57,14 +62,22 @@ export class MatchMaker {
 
   rankCandidates(user: UserProfile, candidates: UserProfile[], context: BCIContext): MatchResult[] {
     const prioritizeVip = this.shouldEscalateToPriorityFeed(context);
+    const userElo = user.eloRating ?? 1000;
 
     return candidates
       .filter((candidate) => candidate.id !== user.id)
-      .map((candidate) => ({
-        candidate,
-        score: this.calculateCompatibility(user.interestGraph, candidate.interestGraph, context),
-        shouldTransitionLoop: this.shouldTransitionLoop(context)
-      }))
+      .map((candidate) => {
+        const base = this.calculateCompatibility(user.interestGraph, candidate.interestGraph, context);
+        // Grant a 10-point bonus when both users share the same ELO bracket so
+        // that same-skill peers are preferred without overriding a strong
+        // interest-graph match from a different bracket.
+        const eloBonus = sameBracket(userElo, candidate.eloRating ?? 1000) ? 10 : 0;
+        return {
+          candidate,
+          score: Number(Math.min(100, base + eloBonus).toFixed(2)),
+          shouldTransitionLoop: this.shouldTransitionLoop(context)
+        };
+      })
       .sort((a, b) => {
         if (prioritizeVip) {
           const aVip = a.candidate.quantsinkFeed?.isVip ? 1 : 0;
