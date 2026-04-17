@@ -159,9 +159,8 @@ test('ConversationHighlighter: sanitiseText removes URLs', () => {
   const text = 'Check this out: https://example.com/page';
   const sanitised = hl.sanitiseText(text, 'owner', 'Alice');
 
-  // Verify the original domain is gone and replaced with the redaction token.
-  assert.ok(!sanitised.includes('example.com'));
-  assert.ok(sanitised.includes('[REDACTED]'));
+  // The entire URL should be replaced; verify the result matches exactly.
+  assert.equal(sanitised, 'Check this out: [REDACTED]');
 });
 
 test('ConversationHighlighter: sanitiseText anonymises @mentions', () => {
