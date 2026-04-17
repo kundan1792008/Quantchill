@@ -15,8 +15,18 @@ export interface PhysicsConfig {
   springConstant: number;
 }
 
+/** Typed interface for the simulated (and future real) WASM physics module. */
+interface PhysicsWasmModule {
+  _initPhysics(mass: number, damping: number, springConstant: number): void;
+  _updateHologramPosition(deltaTime: number): void;
+  _applyPushForce(fx: number, fy: number, fz: number): void;
+  _applyPullForce(fx: number, fy: number, fz: number): void;
+  _getPosition(): [number, number, number];
+  _getVelocity(): number;
+}
+
 export class HologramPhysicsEngine {
-  private wasmModule: any = null;
+  private wasmModule: PhysicsWasmModule | null = null;
   private initialized = false;
   private readonly defaultConfig: PhysicsConfig = {
     mass: 1.0,
@@ -56,7 +66,8 @@ export class HologramPhysicsEngine {
       throw new Error('Physics engine not initialized');
     }
 
-    this.wasmModule._updateHologramPosition(deltaTime);
+    // wasmModule is guaranteed non-null when initialized === true
+    this.wasmModule!._updateHologramPosition(deltaTime);
     return this.getPosition();
   }
 
@@ -65,7 +76,7 @@ export class HologramPhysicsEngine {
    */
   applyPushForce(force: Vec3): void {
     if (!this.initialized) return;
-    this.wasmModule._applyPushForce(force.x, force.y, force.z);
+    this.wasmModule!._applyPushForce(force.x, force.y, force.z);
   }
 
   /**
@@ -73,7 +84,7 @@ export class HologramPhysicsEngine {
    */
   applyPullForce(force: Vec3): void {
     if (!this.initialized) return;
-    this.wasmModule._applyPullForce(force.x, force.y, force.z);
+    this.wasmModule!._applyPullForce(force.x, force.y, force.z);
   }
 
   /**
@@ -84,7 +95,7 @@ export class HologramPhysicsEngine {
       return { x: 0, y: 0, z: 0 };
     }
 
-    const pos = this.wasmModule._getPosition();
+    const pos = this.wasmModule!._getPosition();
     return { x: pos[0], y: pos[1], z: pos[2] };
   }
 
@@ -93,14 +104,14 @@ export class HologramPhysicsEngine {
    */
   getVelocity(): number {
     if (!this.initialized) return 0;
-    return this.wasmModule._getVelocity();
+    return this.wasmModule!._getVelocity();
   }
 
   /**
    * Simulated WASM module using native JavaScript
    * Replace with actual WASM module in production
    */
-  private createSimulatedWasmModule() {
+  private createSimulatedWasmModule(): PhysicsWasmModule {
     let position = { x: 0, y: 0, z: 0 };
     let velocity = { x: 0, y: 0, z: 0 };
     let acceleration = { x: 0, y: 0, z: 0 };
@@ -177,7 +188,7 @@ export class HologramPhysicsEngine {
         acceleration.z -= fz / mass;
       },
 
-      _getPosition: () => [position.x, position.y, position.z],
+      _getPosition: (): [number, number, number] => [position.x, position.y, position.z],
 
       _getVelocity: () => Math.sqrt(
         velocity.x * velocity.x +

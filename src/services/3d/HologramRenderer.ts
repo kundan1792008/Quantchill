@@ -40,7 +40,8 @@ export class HologramRenderer {
 
     // Initialize Three.js scene
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x000000);
+    // Keep background null so the alpha channel from WebGLRenderer is respected,
+    // allowing the hologram to overlay on top of a video stream.
 
     // Setup camera
     const aspect = container.clientWidth / container.clientHeight;

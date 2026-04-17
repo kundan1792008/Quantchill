@@ -25,7 +25,7 @@ export class HapticFeedbackService {
 
   constructor(config: HapticConfig = { enabled: true, intensityMultiplier: 1.0 }) {
     this.config = config;
-    this.checkHapticSupport();
+    void this.checkHapticSupport();
   }
 
   /**
@@ -137,8 +137,10 @@ export class HapticFeedbackService {
 
     try {
       await Haptics.selectionStart();
-      setTimeout(async () => {
-        await Haptics.selectionEnd();
+      setTimeout(() => {
+        void Haptics.selectionEnd().catch((err) => {
+          console.error('Selection end feedback error:', err);
+        });
       }, 50);
     } catch (error) {
       console.error('Selection feedback error:', error);
