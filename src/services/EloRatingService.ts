@@ -67,6 +67,11 @@ const DEFAULT_ELO = 1000;
  * modestly. This is deliberate: we do not want users to feel a visible
  * "rating drop" after one skip, which is a known anxiety driver in rated
  * matching products.
+ *
+ * Rationale for 0.2: with K ≤ 40, the maximum raw per-swipe delta is ~40
+ * points; alpha=0.2 caps the per-swipe displayed delta at ~8 points – large
+ * enough to trend over a few interactions, small enough that no single swipe
+ * produces a visible jolt. Revisit if K-factor constants change materially.
  */
 export const RATING_SMOOTHING_ALPHA = 0.2;
 

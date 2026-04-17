@@ -93,7 +93,11 @@ export const QUALITY_WINDOW_SIZE = 20;
 /**
  * Median decision time (ms) below which swipes in the window are considered
  * low-quality. 300 ms is well below the threshold at which a user can have
- * meaningfully processed a profile photo + bio. Tune with product data.
+ * meaningfully processed a profile photo + bio: human visual-recognition
+ * studies put basic scene gist at ~100–150 ms, and reading even a short bio
+ * line adds several hundred ms on top. A 300 ms median therefore indicates
+ * decisions driven by thumb momentum rather than content. Tune with product
+ * data; this is a starting heuristic, not a research-derived constant.
  */
 export const LOW_QUALITY_MEDIAN_MS = 300;
 
@@ -108,6 +112,12 @@ export const LOW_QUALITY_WEIGHT = 0.25;
  * Maximum inter-swipe gap, in ms, counted as "active" time. Gaps longer than
  * this are capped to avoid inflating active-minutes when the app is
  * backgrounded or the user walks away.
+ *
+ * 90 s chosen as a conservative upper bound on a "reading a long bio +
+ * looking at multiple photos" pause. Any gap larger than that is much more
+ * likely to be distraction / background / context-switch time than active
+ * use, and counting it would make the daily summary misleading in the
+ * direction that matters most for wellbeing (over-reporting time spent).
  */
 export const ACTIVE_GAP_CAP_MS = 90_000;
 

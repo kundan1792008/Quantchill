@@ -54,10 +54,23 @@ export const TIME_ON_CARD_SATURATION_MS = 8_000;
  */
 export const SCROLL_SPEED_CEILING_PX_S = 2_000;
 
-/** Revisit count at which the `revisit` sub-score saturates. */
+/**
+ * Revisit count at which the `revisit` sub-score saturates.
+ *
+ * Intuition: a first revisit is a strong signal the viewer is interested; a
+ * second revisit confirms deliberate consideration; a third is near-certain
+ * interest. Beyond 3 we have no additional information worth encoding, so
+ * we saturate to avoid letting a handful of "stuck on one profile" users
+ * dominate the signal distribution.
+ */
 export const REVISIT_SATURATION = 3;
 
-/** Pause count at which the `pause` sub-score saturates. */
+/**
+ * Pause count at which the `pause` sub-score saturates. Slightly higher than
+ * revisit saturation because pauses are cheaper (a single dwell can produce
+ * multiple pause events), so we require a few more before declaring a
+ * maximal signal.
+ */
 export const PAUSE_SATURATION = 4;
 
 /**
