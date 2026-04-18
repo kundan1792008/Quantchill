@@ -11,14 +11,15 @@ datasource db {
 }
 
 model User {
-  id          String        @id @default(cuid())
-  email       String        @unique
-  name        String?
-  isPremium   Boolean       @default(false)
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
-  moodProfile MoodProfile?
-  sessions    Session[]
+  id                 String                  @id @default(cuid())
+  email              String                  @unique
+  name               String?
+  isPremium          Boolean                 @default(false)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  moodProfile        MoodProfile?
+  sessions           Session[]
+  wellbeingSettings  UserWellbeingSettings?
 }
 
 model MoodProfile {
@@ -54,4 +55,20 @@ model GeneratedTrack {
   intensity   Float
   variation   Int      @default(0)
   generatedAt DateTime @default(now())
+}
+
+/// Per-user wellbeing controls.
+///
+/// All fields default to the least-intrusive value. `hideEloRating` defaults
+/// to TRUE so that a user's rating is never shown until they explicitly opt
+/// in. `breakRemindersEnabled` defaults to FALSE so the app never surfaces
+/// usage nudges without consent.
+model UserWellbeingSettings {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hideEloRating         Boolean  @default(true)
+  dailyTimeLimitMinutes Int?
+  breakRemindersEnabled Boolean  @default(false)
+  updatedAt             DateTime @updatedAt
 }

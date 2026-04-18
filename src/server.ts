@@ -8,6 +8,9 @@ import { MoodEngine, MoodName } from './services/MoodEngine';
 import { SessionTracker } from './services/SessionTracker';
 import { EloRatingService, SwipeOutcome } from './services/EloRatingService';
 import { HiveMindAlgorithm } from './services/HiveMindAlgorithm';
+import { UserWellbeingSettingsService, UpdateSettingsInput } from './services/UserWellbeingSettings';
+import { SwipeQualityService, SwipeObservation } from './services/SwipeQualityService';
+import { MatchRaritySystem, CompatibilitySignals } from './services/MatchRaritySystem';
 import { RateLimiter } from './services/RateLimiter';
 import { SafetyService, ReportReason } from './services/SafetyService';
 import { EloService } from './services/EloService';
@@ -41,8 +44,11 @@ const app = Fastify({ logger: true });
 const handshakeService = new BiometricHandshakeService();
 const hiveMind = new HiveMindAlgorithm();
 const matchMaker = new MatchMaker(40, hiveMind);
-const eloService = new EloRatingService();
+const wellbeingSettings = new UserWellbeingSettingsService();
+const eloService = new EloRatingService(wellbeingSettings);
 const sessionTracker = new SessionTracker();
+const swipeQuality = new SwipeQualityService({ settings: wellbeingSettings });
+const matchRarity = new MatchRaritySystem();
 const safetyService = new SafetyService();
 
 /**
@@ -250,6 +256,115 @@ app.get<{ Params: { userId: string } }>('/elo/:userId', async (request, reply) =
   return { ...record, bracket: eloService.getBracket(userId) };
 });
 
+/**
+ * User-facing display rating. Honours `UserWellbeingSettings.hideEloRating`
+ * (default: hidden). Returns `{ rating: null, visible: false }` when the user
+ * has not opted in, rather than leaking the raw number via a side channel.
+ *
+ * This endpoint is pull-only and intended to be called with an authenticated
+ * session that belongs to `userId`. No push, no ticker, no cross-user reads.
+ */
+app.get<{ Params: { userId: string } }>('/elo/:userId/display', async (request, reply) => {
+  const { userId } = request.params;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+
+  const visible = wellbeingSettings.isRatingVisible(userId);
+  return {
+    userId,
+    visible,
+    rating: visible ? eloService.getDisplayRating(userId) : null
+  };
+});
+
+/**
+ * Read-only rating history for the authenticated user. Returns `null` when
+ * the user has opted out of seeing their rating.
+ */
+app.get<{ Params: { userId: string }; Querystring: { sinceMs?: string } }>(
+  '/elo/:userId/history',
+  async (request, reply) => {
+    const { userId } = request.params;
+    if (!userId) return reply.status(400).send({ error: 'userId is required' });
+    const sinceMs = request.query.sinceMs ? Number(request.query.sinceMs) : undefined;
+    if (sinceMs !== undefined && !Number.isFinite(sinceMs)) {
+      return reply.status(400).send({ error: 'sinceMs must be a number' });
+    }
+    const history = eloService.getRatingHistory(userId, sinceMs);
+    if (history === null) {
+      return reply.status(403).send({ error: 'rating-hidden', visible: false });
+    }
+    return { userId, visible: true, history };
+  }
+);
+
+// ─── User wellbeing settings ─────────────────────────────────────────────────
+
+app.get<{ Params: { userId: string } }>('/users/:userId/wellbeing', async (request, reply) => {
+  const { userId } = request.params;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+  return wellbeingSettings.get(userId);
+});
+
+app.patch<{ Params: { userId: string }; Body: UpdateSettingsInput }>(
+  '/users/:userId/wellbeing',
+  async (request, reply) => {
+    const { userId } = request.params;
+    if (!userId) return reply.status(400).send({ error: 'userId is required' });
+    try {
+      return wellbeingSettings.update(userId, request.body ?? {});
+    } catch (err) {
+      return reply.status(400).send({ error: (err as Error).message });
+    }
+  }
+);
+
+// ─── Swipe quality / usage awareness / superlikes ────────────────────────────
+
+app.post<{
+  Body: { userId: string; observation: SwipeObservation };
+}>('/swipe-quality/record', async (request, reply) => {
+  const { userId, observation } = request.body ?? ({} as { userId: string; observation: SwipeObservation });
+  if (!userId || !observation || typeof observation.decisionTimeMs !== 'number') {
+    return reply.status(400).send({ error: 'userId and observation.decisionTimeMs required' });
+  }
+  try {
+    return swipeQuality.recordSwipe(userId, {
+      timestamp: observation.timestamp ?? Date.now(),
+      decisionTimeMs: observation.decisionTimeMs
+    });
+  } catch (err) {
+    return reply.status(400).send({ error: (err as Error).message });
+  }
+});
+
+app.get<{ Params: { userId: string } }>('/users/:userId/usage-summary', async (request, reply) => {
+  const { userId } = request.params;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+  return swipeQuality.getDailyUsageSummary(userId);
+});
+
+app.get<{ Params: { userId: string } }>('/users/:userId/superlikes', async (request, reply) => {
+  const { userId } = request.params;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+  return swipeQuality.getSuperlikeState(userId);
+});
+
+app.post<{ Body: { userId: string } }>('/users/superlikes/consume', async (request, reply) => {
+  const { userId } = request.body ?? ({} as { userId: string });
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+  const ok = swipeQuality.consumeSuperlike(userId);
+  return { consumed: ok, state: swipeQuality.getSuperlikeState(userId) };
+});
+
+// ─── Compatibility (neutral tiers) ───────────────────────────────────────────
+
+app.post<{ Body: { signals: CompatibilitySignals } }>('/compatibility', async (request, reply) => {
+  const signals = request.body?.signals;
+  if (!signals || typeof signals !== 'object') {
+    return reply.status(400).send({ error: 'signals object required' });
+  }
+  return matchRarity.compute(signals);
+});
 
 // ─── Mood Engine REST routes ─────────────────────────────────────────────────
 
