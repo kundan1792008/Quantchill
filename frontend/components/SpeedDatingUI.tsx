@@ -303,7 +303,7 @@ function CountdownScreen({
           onClick={onAccept}
           className="px-6 py-3 rounded-full bg-gradient-to-r from-pink-500 to-violet-500 font-semibold shadow-xl"
         >
-          I'm ready →
+          I&apos;m ready →
         </motion.button>
       </div>
     </div>
@@ -520,11 +520,8 @@ function PostCallScreen({
   onStartChat,
   onRequeue
 }: Pick<SpeedDatingUIProps, 'postCallOutcome' | 'onStartChat' | 'onRequeue'>) {
-  if (!postCallOutcome) return null;
-  const isMatch = postCallOutcome.kind === 'mutual-match';
-  const isFomo = postCallOutcome.kind === 'they-liked-you';
-
-  const { title, subtitle, emoji, primary, secondary } = useMemo(() => {
+  const content = useMemo(() => {
+    if (!postCallOutcome) return null;
     switch (postCallOutcome.kind) {
       case 'mutual-match':
         return {
@@ -540,15 +537,15 @@ function PostCallScreen({
           subtitle: 'You passed — but they were into it. Keep going!',
           emoji: '💫',
           primary: 'Next person',
-          secondary: null
+          secondary: null as string | null
         };
       case 'you-liked-them':
         return {
           title: 'Not this time',
-          subtitle: `${postCallOutcome.partnerName} wasn&apos;t feeling it — but plenty more ahead.`,
+          subtitle: `${postCallOutcome.partnerName} was not feeling it — but plenty more ahead.`,
           emoji: '💪',
           primary: 'Next person',
-          secondary: null
+          secondary: null as string | null
         };
       case 'no-match':
         return {
@@ -556,7 +553,7 @@ function PostCallScreen({
           subtitle: `You and ${postCallOutcome.partnerName} both skipped. On to the next.`,
           emoji: '➡️',
           primary: 'Next person',
-          secondary: null
+          secondary: null as string | null
         };
       case 'no-votes':
       default:
@@ -565,10 +562,15 @@ function PostCallScreen({
           subtitle: 'Neither of you voted in time.',
           emoji: '⏰',
           primary: 'Next person',
-          secondary: null
+          secondary: null as string | null
         };
     }
   }, [postCallOutcome]);
+
+  if (!postCallOutcome || !content) return null;
+  const isMatch = postCallOutcome.kind === 'mutual-match';
+  const isFomo = postCallOutcome.kind === 'they-liked-you';
+  const { title, subtitle, emoji, primary, secondary } = content;
 
   const gradient = isMatch
     ? 'from-pink-500 via-fuchsia-500 to-violet-600'
@@ -577,7 +579,7 @@ function PostCallScreen({
       : 'from-slate-700 to-slate-900';
 
   function primaryAction() {
-    if (isMatch && postCallOutcome.kind === 'mutual-match') {
+    if (postCallOutcome && postCallOutcome.kind === 'mutual-match') {
       onStartChat?.(postCallOutcome.chatRoomId);
       return;
     }
