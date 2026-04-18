@@ -1,118 +1,99 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SwipeProcessor } from '../src/services/SwipeProcessor';
 import { EloService } from '../src/services/EloService';
+import { SwipeProcessor } from '../src/services/SwipeProcessor';
 
-function makeProcessor(): SwipeProcessor {
-  return new SwipeProcessor(new EloService());
+function buildProcessor(opts?: { now?: () => number }) {
+  const elo = new EloService();
+  const sp = new SwipeProcessor(elo, {
+    now: opts?.now,
+    rapidSkipWindowMs: 10_000,
+    rapidSkipThreshold: 5,
+    cooldownMs: 30_000
+  });
+  return { elo, sp };
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
-test('SwipeProcessor like updates ELO for both parties', () => {
-  const p = makeProcessor();
-  const result = p.process({
-    userId: 'alice',
-    targetId: 'bob',
-    action: 'like',
-    dwellTimeMs: 500,
-    scrollVelocity: 200
-  });
-  assert.equal(result.userId, 'alice');
-  assert.equal(result.action, 'like');
-  assert.ok(result.userRating > 0);
-  assert.ok(result.targetRating > 0);
-  assert.equal(result.cooldownApplied, false);
+test('SwipeProcessor rejects self-swipe', () => {
+  const { sp } = buildProcessor();
+  assert.throws(() => sp.process({ userId: 'a', targetId: 'a', action: 'like', dwellTimeMs: 0, scrollVelocity: 0 }));
 });
 
-test('SwipeProcessor dwell > 3000 ms adds +2 compatibility', () => {
-  const p = makeProcessor();
-  const result = p.process({
-    userId: 'alice',
-    targetId: 'bob',
-    action: 'like',
-    dwellTimeMs: 4000,
-    scrollVelocity: 200
-  });
-  assert.ok(result.compatibilityDelta >= 2, `Expected >=2, got ${result.compatibilityDelta}`);
+test('SwipeProcessor rejects unknown actions', () => {
+  const { sp } = buildProcessor();
+  assert.throws(() =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sp.process({ userId: 'a', targetId: 'b', action: 'poke' as any, dwellTimeMs: 10, scrollVelocity: 10 })
+  );
 });
 
-test('SwipeProcessor scroll < 100 px/s adds +1 compatibility', () => {
-  const p = makeProcessor();
-  const result = p.process({
-    userId: 'alice',
-    targetId: 'bob',
-    action: 'like',
-    dwellTimeMs: 100,
-    scrollVelocity: 50
-  });
-  assert.ok(result.compatibilityDelta >= 1, `Expected >=1, got ${result.compatibilityDelta}`);
+test('SwipeProcessor awards +2 compatibility for dwell > 3000 ms', () => {
+  const { sp } = buildProcessor();
+  const r = sp.process({ userId: 'a', targetId: 'b', action: 'like', dwellTimeMs: 4000, scrollVelocity: 200 });
+  assert.ok(r.reasons.includes('high-dwell'));
+  assert.ok(r.compatibilityDelta >= 2);
 });
 
-test('SwipeProcessor both signals give +3 compatibility', () => {
-  const p = makeProcessor();
-  const result = p.process({
-    userId: 'alice',
-    targetId: 'bob',
-    action: 'like',
-    dwellTimeMs: 5000,
-    scrollVelocity: 30
-  });
-  assert.equal(result.compatibilityDelta, 3);
+test('SwipeProcessor awards +1 compatibility for scroll velocity < 100 px/s', () => {
+  const { sp } = buildProcessor();
+  const r = sp.process({ userId: 'a', targetId: 'b', action: 'like', dwellTimeMs: 500, scrollVelocity: 50 });
+  assert.ok(r.reasons.includes('careful-browsing'));
+  assert.ok(r.compatibilityDelta >= 1);
 });
 
-test('SwipeProcessor no signals gives 0 compatibility delta', () => {
-  const p = makeProcessor();
-  const result = p.process({
-    userId: 'alice',
-    targetId: 'bob',
-    action: 'skip',
-    dwellTimeMs: 100,
-    scrollVelocity: 200
-  });
-  assert.equal(result.compatibilityDelta, 0);
+test('SwipeProcessor awards superlike bonus', () => {
+  const { sp } = buildProcessor();
+  const r = sp.process({ userId: 'a', targetId: 'b', action: 'superlike', dwellTimeMs: 0, scrollVelocity: 500 });
+  assert.ok(r.reasons.includes('superlike'));
+  assert.equal(r.compatibilityDelta, 5);
 });
 
-test('SwipeProcessor 6 rapid skips trigger cooldown', () => {
-  const p = makeProcessor();
-  let lastResult;
-  for (let i = 0; i < 7; i++) {
-    lastResult = p.process({
-      userId: 'spammer',
-      targetId: `target${i}`,
-      action: 'skip',
-      dwellTimeMs: 100,
-      scrollVelocity: 300
-    });
+test('SwipeProcessor applies cooldown after 5 skips in 10 s', () => {
+  let now = 0;
+  const { sp } = buildProcessor({ now: () => now });
+  for (let i = 0; i < 4; i += 1) {
+    now += 1000;
+    const r = sp.process({ userId: 'a', targetId: `t${i}`, action: 'skip', dwellTimeMs: 0, scrollVelocity: 500 });
+    assert.equal(r.cooldownApplied, false);
   }
-  assert.equal(lastResult?.cooldownApplied, true);
-  assert.equal(p.isInCooldown('spammer'), true);
+  now += 1000;
+  const last = sp.process({ userId: 'a', targetId: 't5', action: 'skip', dwellTimeMs: 0, scrollVelocity: 500 });
+  assert.equal(last.cooldownApplied, true);
+  assert.ok(sp.isInCooldown('a'));
 });
 
-test('SwipeProcessor cooldown prevents ELO update', () => {
-  const p = makeProcessor();
-  // Trigger cooldown by spamming skips.
-  for (let i = 0; i < 7; i++) {
-    p.process({ userId: 'spammer', targetId: `t${i}`, action: 'skip', dwellTimeMs: 100, scrollVelocity: 300 });
+test('SwipeProcessor does NOT cool down when skips are spread over > 10 s', () => {
+  let now = 0;
+  const { sp } = buildProcessor({ now: () => now });
+  for (let i = 0; i < 6; i += 1) {
+    now += 3000;
+    sp.process({ userId: 'a', targetId: `t${i}`, action: 'skip', dwellTimeMs: 0, scrollVelocity: 500 });
   }
-  assert.equal(p.isInCooldown('spammer'), true);
-  const eloService = (p as unknown as { eloService: EloService }).eloService;
-  const ratingBefore = eloService.getRating('spammer');
-  p.process({ userId: 'spammer', targetId: 'newTarget', action: 'like', dwellTimeMs: 100, scrollVelocity: 200 });
-  // Rating should be unchanged because of cooldown.
-  assert.equal(eloService.getRating('spammer'), ratingBefore);
+  assert.equal(sp.isInCooldown('a'), false);
 });
 
-test('SwipeProcessor cooldownExpiry returns null when not in cooldown', () => {
-  const p = makeProcessor();
-  assert.equal(p.cooldownExpiry('fresh'), null);
+test('SwipeProcessor detects mutual matches across both directions', () => {
+  const { sp } = buildProcessor();
+  sp.process({ userId: 'a', targetId: 'b', action: 'like', dwellTimeMs: 100, scrollVelocity: 500 });
+  const r = sp.process({ userId: 'b', targetId: 'a', action: 'like', dwellTimeMs: 100, scrollVelocity: 500 });
+  assert.equal(r.mutualMatch, true);
+  assert.deepEqual(sp.getMutualMatches('a'), ['b']);
 });
 
-test('SwipeProcessor cooldownExpiry returns future timestamp during cooldown', () => {
-  const p = makeProcessor();
-  for (let i = 0; i < 7; i++) {
-    p.process({ userId: 'u', targetId: `t${i}`, action: 'skip', dwellTimeMs: 100, scrollVelocity: 300 });
-  }
-  const expiry = p.cooldownExpiry('u');
-  assert.ok(expiry !== null && expiry > Date.now(), `Expected future expiry, got ${expiry}`);
+test('SwipeProcessor updates Glicko ratings on each swipe', () => {
+  const { elo, sp } = buildProcessor();
+  sp.process({ userId: 'a', targetId: 'b', action: 'like', dwellTimeMs: 0, scrollVelocity: 500 });
+  // 'like' means viewer "won" → rating goes up, target goes down.
+  assert.ok(elo.getRecord('a').rating > 1500);
+  assert.ok(elo.getRecord('b').rating < 1500);
+});
+
+test('SwipeProcessor prune drops stale traces', () => {
+  let now = 0;
+  const { sp } = buildProcessor({ now: () => now });
+  sp.process({ userId: 'a', targetId: 'b', action: 'skip', dwellTimeMs: 0, scrollVelocity: 500 });
+  now += 60_000;
+  sp.prune();
+  // After pruning, cooldown/skip-trace for 'a' should be gone.
+  assert.equal(sp.isInCooldown('a'), false);
 });

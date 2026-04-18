@@ -1,241 +1,313 @@
 /**
- * MatchQueue – in-memory match queue with Redis Sorted Set semantics.
+ * MatchQueue – Redis-compatible sorted-set bracket queue for Quantchill matchmaking.
  *
- * Implements the bracket-based queue described in the Quantchill matchmaking
- * spec without requiring a live Redis connection.  The public interface is
- * identical to a Redis-backed implementation so that swapping in `ioredis`
- * later is a purely infrastructure concern.
+ * Each ELO bracket has its own sorted set keyed `matchqueue:{bracket}` where the
+ * **score** is the user's wait-time start timestamp (ms). Sorting by score gives
+ * O(log N) lookup of the longest-waiting user. A second sorted set keyed
+ * `matchqueue:{bracket}:elo` stores the same users scored by their ELO rating,
+ * enabling `findMatch` to discover the closest-rated peer with a single
+ * `ZRANGEBYSCORE` call.
  *
- * Queue structure mirrors: `matchqueue:{bracket}` → sorted set keyed by
- * enqueue timestamp (waitTime) so `dequeue` always pops the longest-waiting
- * user.
+ * The match radius starts at ±200 ELO and expands by +50 every 5 seconds a user
+ * has been waiting, preventing indefinite stalls in sparse brackets.
  *
- * Features:
- *  - O(log N) bracket lookup (sorted array insertion).
- *  - `enqueue(userId, elo)` → add to the appropriate bracket sorted set.
- *  - `dequeue(bracket)` → pop the longest-waiting user from a bracket.
- *  - `findMatch(userId)` → find the closest-ELO user within ±200 pts;
- *    radius expands by 50 every 5 seconds of waiting.
- *  - Pub/sub simulation via EventEmitter for cross-server match notifications.
+ * A pluggable `SortedSetStore` abstracts the underlying engine so that an
+ * `IORedis`-backed store can be swapped in for production without touching the
+ * business logic. Pub/sub notifications are emitted through a lightweight
+ * `EventEmitter` so that a Redis pub/sub adapter can forward them across servers.
  */
 
 import { EventEmitter } from 'node:events';
-import { getGlicko2Bracket, type Glicko2Bracket } from './EloService';
+import { getEloBracket, EloBracket } from './EloRatingService';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+/** A member of a sorted set. */
+export interface SortedSetMember {
+  member: string;
+  score: number;
+}
 
-/** An entry in the match queue. */
-export interface QueueEntry {
+/**
+ * Minimal interface implemented by an in-memory and a Redis-backed store.
+ * Methods mirror the Redis commands they're named after.
+ */
+export interface SortedSetStore {
+  /** ZADD key score member – insert or update a member. */
+  zadd(key: string, score: number, member: string): void;
+  /** ZREM key member – remove a member; returns true if present. */
+  zrem(key: string, member: string): boolean;
+  /** ZSCORE key member – return a member's score or null. */
+  zscore(key: string, member: string): number | null;
+  /** ZCARD key – return the cardinality of the set. */
+  zcard(key: string): number;
+  /** ZRANGE key start stop – return members ordered by ascending score. */
+  zrange(key: string, start: number, stop: number): SortedSetMember[];
+  /** ZPOPMIN key – pop the lowest-scored member atomically. */
+  zpopmin(key: string): SortedSetMember | null;
+  /** ZRANGEBYSCORE key min max – return members with min ≤ score ≤ max. */
+  zrangebyscore(key: string, min: number, max: number): SortedSetMember[];
+  /** Remove every sorted set – used for tests. */
+  flushall(): void;
+}
+
+/** Default in-memory store. */
+export class InMemorySortedSetStore implements SortedSetStore {
+  private readonly sets = new Map<string, Map<string, number>>();
+
+  private getSet(key: string): Map<string, number> {
+    let s = this.sets.get(key);
+    if (!s) {
+      s = new Map();
+      this.sets.set(key, s);
+    }
+    return s;
+  }
+
+  zadd(key: string, score: number, member: string): void {
+    this.getSet(key).set(member, score);
+  }
+
+  zrem(key: string, member: string): boolean {
+    const s = this.sets.get(key);
+    if (!s) return false;
+    return s.delete(member);
+  }
+
+  zscore(key: string, member: string): number | null {
+    const s = this.sets.get(key);
+    if (!s || !s.has(member)) return null;
+    return s.get(member) as number;
+  }
+
+  zcard(key: string): number {
+    return this.sets.get(key)?.size ?? 0;
+  }
+
+  zrange(key: string, start: number, stop: number): SortedSetMember[] {
+    const s = this.sets.get(key);
+    if (!s) return [];
+    const sorted = Array.from(s.entries())
+      .map(([member, score]) => ({ member, score }))
+      .sort((a, b) => a.score - b.score || a.member.localeCompare(b.member));
+    const end = stop < 0 ? sorted.length + stop + 1 : stop + 1;
+    return sorted.slice(start, end);
+  }
+
+  zpopmin(key: string): SortedSetMember | null {
+    const s = this.sets.get(key);
+    if (!s || s.size === 0) return null;
+    const [first] = this.zrange(key, 0, 0);
+    if (!first) return null;
+    s.delete(first.member);
+    return first;
+  }
+
+  zrangebyscore(key: string, min: number, max: number): SortedSetMember[] {
+    const s = this.sets.get(key);
+    if (!s) return [];
+    return Array.from(s.entries())
+      .filter(([, score]) => score >= min && score <= max)
+      .map(([member, score]) => ({ member, score }))
+      .sort((a, b) => a.score - b.score);
+  }
+
+  flushall(): void {
+    this.sets.clear();
+  }
+}
+
+/** Public shape of a queued user. */
+export interface QueuedUser {
   userId: string;
   elo: number;
-  bracket: Glicko2Bracket;
+  bracket: EloBracket;
   enqueuedAt: number;
 }
 
-/** Result returned when a match is found. */
-export interface MatchPair {
-  userA: QueueEntry;
-  userB: QueueEntry;
+/** Configuration for `MatchQueue`. */
+export interface MatchQueueOptions {
+  store?: SortedSetStore;
+  emitter?: EventEmitter;
+  /** Base search radius in ELO points. Default 200. */
+  baseRadius?: number;
+  /** ELO radius expansion per interval (default +50). */
+  radiusIncrement?: number;
+  /** Interval (ms) between expansions. Default 5000. */
+  radiusIntervalMs?: number;
+  /** Maximum radius. Default 1000. */
+  maxRadius?: number;
+  /** Clock override, used for deterministic tests. */
+  now?: () => number;
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+/** Event payloads emitted on the queue event bus. */
+export interface MatchQueueEvents {
+  enqueue: QueuedUser;
+  dequeue: QueuedUser;
+  match: { a: QueuedUser; b: QueuedUser; bracket: EloBracket };
+}
 
-/** Initial ELO search radius (rating points). */
-const INITIAL_RADIUS = 200;
-/** Radius expansion per time window. */
-const RADIUS_STEP = 50;
-/** Time window (ms) after which the search radius expands. */
-const EXPAND_INTERVAL_MS = 5_000;
-/** Maximum ELO search radius before accepting any bracket partner. */
-const MAX_RADIUS = 600;
+function bracketKey(bracket: EloBracket): string {
+  return `matchqueue:${bracket}`;
+}
 
-// ─── MatchQueue ───────────────────────────────────────────────────────────────
+function bracketEloKey(bracket: EloBracket): string {
+  return `matchqueue:${bracket}:elo`;
+}
 
 /**
- * MatchQueue – bracket-aware match queue.
+ * High-performance bracket queue.
  *
- * Internally each bracket maps to a sorted array of QueueEntry objects ordered
- * ascending by `enqueuedAt` (longest-waiting first when shifted from the front).
+ * All writes touch two sorted sets (wait-time + ELO) atomically through the
+ * `SortedSetStore`, so a Redis-backed store would execute both in a single
+ * `MULTI` pipeline for crash-consistency.
  */
-export class MatchQueue extends EventEmitter {
-  /** Bracket → sorted array of QueueEntry (ascending enqueuedAt). */
-  private readonly queues = new Map<Glicko2Bracket, QueueEntry[]>();
+export class MatchQueue {
+  private readonly store: SortedSetStore;
+  private readonly emitter: EventEmitter;
+  private readonly baseRadius: number;
+  private readonly radiusIncrement: number;
+  private readonly radiusIntervalMs: number;
+  private readonly maxRadius: number;
+  private readonly now: () => number;
+  private readonly metadata = new Map<string, QueuedUser>();
 
-  /** userId → QueueEntry for O(1) membership checks. */
-  private readonly members = new Map<string, QueueEntry>();
-
-  constructor() {
-    super();
+  constructor(options: MatchQueueOptions = {}) {
+    this.store = options.store ?? new InMemorySortedSetStore();
+    this.emitter = options.emitter ?? new EventEmitter();
+    this.baseRadius = options.baseRadius ?? 200;
+    this.radiusIncrement = options.radiusIncrement ?? 50;
+    this.radiusIntervalMs = options.radiusIntervalMs ?? 5000;
+    this.maxRadius = options.maxRadius ?? 1000;
+    this.now = options.now ?? Date.now;
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────────
-
-  private getQueue(bracket: Glicko2Bracket): QueueEntry[] {
-    if (!this.queues.has(bracket)) {
-      this.queues.set(bracket, []);
-    }
-    return this.queues.get(bracket)!;
+  /** Subscribe to queue events. */
+  on<K extends keyof MatchQueueEvents>(
+    event: K,
+    listener: (payload: MatchQueueEvents[K]) => void
+  ): void {
+    this.emitter.on(event, listener);
   }
 
-  /**
-   * Binary-search insert to maintain ascending `enqueuedAt` order in O(log N).
-   */
-  private insertSorted(queue: QueueEntry[], entry: QueueEntry): void {
-    let lo = 0;
-    let hi = queue.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (queue[mid]!.enqueuedAt <= entry.enqueuedAt) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    queue.splice(lo, 0, entry);
+  /** Unsubscribe from queue events. */
+  off<K extends keyof MatchQueueEvents>(
+    event: K,
+    listener: (payload: MatchQueueEvents[K]) => void
+  ): void {
+    this.emitter.off(event, listener);
   }
 
-  /** Remove an entry from a bracket queue by userId. */
-  private removeFromQueue(bracket: Glicko2Bracket, userId: string): boolean {
-    const queue = this.getQueue(bracket);
-    const idx = queue.findIndex((e) => e.userId === userId);
-    if (idx === -1) return false;
-    queue.splice(idx, 1);
-    return true;
+  /** Enqueue a user into the bracket sorted set. */
+  enqueue(userId: string, elo: number): QueuedUser {
+    const bracket = getEloBracket(elo);
+    const enqueuedAt = this.now();
+    this.store.zadd(bracketKey(bracket), enqueuedAt, userId);
+    this.store.zadd(bracketEloKey(bracket), elo, userId);
+    const record: QueuedUser = { userId, elo, bracket, enqueuedAt };
+    this.metadata.set(userId, record);
+    this.emitter.emit('enqueue', record);
+    return record;
   }
 
-  /**
-   * Compute the effective ELO search radius for a queued user.
-   *
-   * Radius expands by RADIUS_STEP every EXPAND_INTERVAL_MS of wait time,
-   * capped at MAX_RADIUS.
-   */
-  private effectiveRadius(enqueuedAt: number, now = Date.now()): number {
-    const waitMs = Math.max(0, now - enqueuedAt);
-    const expansions = Math.floor(waitMs / EXPAND_INTERVAL_MS);
-    return Math.min(MAX_RADIUS, INITIAL_RADIUS + expansions * RADIUS_STEP);
+  /** Dequeue the longest-waiting user from a specific bracket. */
+  dequeue(bracket: EloBracket): QueuedUser | null {
+    const head = this.store.zpopmin(bracketKey(bracket));
+    if (!head) return null;
+    this.store.zrem(bracketEloKey(bracket), head.member);
+    const record = this.metadata.get(head.member);
+    this.metadata.delete(head.member);
+    const resolved: QueuedUser = record ?? {
+      userId: head.member,
+      elo: 0,
+      bracket,
+      enqueuedAt: head.score
+    };
+    this.emitter.emit('dequeue', resolved);
+    return resolved;
   }
 
-  // ── Public API ───────────────────────────────────────────────────────────
-
-  /**
-   * Add a user to the appropriate ELO bracket queue.
-   * If the user is already queued, their entry is refreshed.
-   */
-  enqueue(userId: string, elo: number): QueueEntry {
-    // Remove existing entry if re-queuing.
-    if (this.members.has(userId)) {
-      this.remove(userId);
-    }
-
-    const bracket = getGlicko2Bracket(elo);
-    const entry: QueueEntry = { userId, elo, bracket, enqueuedAt: Date.now() };
-
-    this.insertSorted(this.getQueue(bracket), entry);
-    this.members.set(userId, entry);
-
-    this.emit('enqueued', entry);
-    return entry;
-  }
-
-  /**
-   * Remove a specific user from the queue (e.g., on disconnect).
-   * Returns true if the user was found and removed.
-   */
+  /** Remove a user from whatever bracket they are in. */
   remove(userId: string): boolean {
-    const entry = this.members.get(userId);
-    if (!entry) return false;
-    this.removeFromQueue(entry.bracket, userId);
-    this.members.delete(userId);
-    this.emit('removed', entry);
+    const record = this.metadata.get(userId);
+    if (!record) return false;
+    this.store.zrem(bracketKey(record.bracket), userId);
+    this.store.zrem(bracketEloKey(record.bracket), userId);
+    this.metadata.delete(userId);
     return true;
   }
 
-  /**
-   * Pop the longest-waiting user from a bracket (O(1) shift).
-   * Returns null if the bracket queue is empty.
-   */
-  dequeue(bracket: Glicko2Bracket): QueueEntry | null {
-    const queue = this.getQueue(bracket);
-    const entry = queue.shift() ?? null;
-    if (entry) {
-      this.members.delete(entry.userId);
-      this.emit('dequeued', entry);
-    }
-    return entry;
+  /** Return the current size of a bracket queue. */
+  size(bracket: EloBracket): number {
+    return this.store.zcard(bracketKey(bracket));
+  }
+
+  /** Return a snapshot of a user's queue record. */
+  getRecord(userId: string): QueuedUser | null {
+    const r = this.metadata.get(userId);
+    return r ? { ...r } : null;
+  }
+
+  /** Return the current search radius for a waiting user. */
+  currentRadius(userId: string): number {
+    const record = this.metadata.get(userId);
+    if (!record) return this.baseRadius;
+    const waitedMs = Math.max(0, this.now() - record.enqueuedAt);
+    const expansions = Math.floor(waitedMs / this.radiusIntervalMs);
+    return Math.min(this.maxRadius, this.baseRadius + expansions * this.radiusIncrement);
   }
 
   /**
-   * Find the best ELO match for a queued user.
+   * Find the closest-ELO peer of `userId` within the dynamic radius.
    *
-   * Algorithm:
-   *  1. Compute the user's current effective radius (expands over time).
-   *  2. Scan the same bracket first for users within ±radius ELO.
-   *  3. If no match found, scan adjacent brackets within the same radius.
-   *  4. Among candidates, pick the one with the smallest ELO difference.
-   *
-   * Both matched users are removed from the queue.
-   * Emits `match-found` with the MatchPair.
-   *
-   * @returns MatchPair if a match was found, null otherwise.
+   * Returns `null` when no candidate is available. The returned record is *not*
+   * automatically removed from the queue – callers should call `remove()` on
+   * both sides after accepting the match so that `findMatch` can be used as a
+   * non-destructive probe for candidate previews.
    */
-  findMatch(userId: string): MatchPair | null {
-    const entry = this.members.get(userId);
-    if (!entry) return null;
-
-    const now = Date.now();
-    const radius = this.effectiveRadius(entry.enqueuedAt, now);
-
-    // Gather all queue entries across all brackets (excluding self).
-    const allEntries: QueueEntry[] = [];
-    for (const queue of this.queues.values()) {
-      for (const e of queue) {
-        if (e.userId !== userId) allEntries.push(e);
-      }
-    }
-
-    // Filter to those within the ELO radius.
-    const candidates = allEntries.filter(
-      (e) => Math.abs(e.elo - entry.elo) <= radius
+  findMatch(userId: string): QueuedUser | null {
+    const record = this.metadata.get(userId);
+    if (!record) return null;
+    const radius = this.currentRadius(userId);
+    const candidates = this.store.zrangebyscore(
+      bracketEloKey(record.bracket),
+      record.elo - radius,
+      record.elo + radius
     );
 
-    if (candidates.length === 0) return null;
-
-    // Pick the closest by ELO delta.
-    candidates.sort((a, b) => Math.abs(a.elo - entry.elo) - Math.abs(b.elo - entry.elo));
-    const partner = candidates[0]!;
-
-    // Remove both from the queue.
-    this.remove(entry.userId);
-    this.remove(partner.userId);
-
-    const pair: MatchPair = { userA: entry, userB: partner };
-    this.emit('match-found', pair);
-    return pair;
+    let best: QueuedUser | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const c of candidates) {
+      if (c.member === userId) continue;
+      const candidateRecord = this.metadata.get(c.member);
+      if (!candidateRecord) continue;
+      const distance = Math.abs(candidateRecord.elo - record.elo);
+      if (distance < bestDistance) {
+        best = candidateRecord;
+        bestDistance = distance;
+      }
+    }
+    return best ? { ...best } : null;
   }
 
-  /** Return the current queue size for a bracket. */
-  queueSize(bracket: Glicko2Bracket): number {
-    return this.getQueue(bracket).length;
+  /**
+   * Atomically dequeue a match for `userId`, returning both participants. Uses
+   * `findMatch` to pick the closest peer, then removes both from the queue and
+   * emits a `match` event.
+   */
+  popMatch(userId: string): { a: QueuedUser; b: QueuedUser } | null {
+    const a = this.getRecord(userId);
+    if (!a) return null;
+    const b = this.findMatch(userId);
+    if (!b) return null;
+    this.remove(a.userId);
+    this.remove(b.userId);
+    this.emitter.emit('match', { a, b, bracket: a.bracket });
+    return { a, b };
   }
 
-  /** Return total users across all brackets. */
-  totalQueued(): number {
-    return this.members.size;
-  }
-
-  /** Check whether a user is currently in the queue. */
-  isQueued(userId: string): boolean {
-    return this.members.has(userId);
-  }
-
-  /** Return a read-only snapshot of a bracket's queue. */
-  peekQueue(bracket: Glicko2Bracket): Readonly<QueueEntry>[] {
-    return [...this.getQueue(bracket)];
-  }
-
-  /** Clear all queues (useful for testing). */
-  clear(): void {
-    this.queues.clear();
-    this.members.clear();
+  /** Flush every bracket – used for tests. */
+  flush(): void {
+    this.store.flushall();
+    this.metadata.clear();
   }
 }

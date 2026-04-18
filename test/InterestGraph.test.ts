@@ -1,124 +1,99 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { InterestGraph, cosineSimilarity } from '../src/services/InterestGraph';
+import { InterestGraph } from '../src/services/InterestGraph';
 
-// ─── cosineSimilarity tests ───────────────────────────────────────────────────
-
-test('cosineSimilarity returns 1 for identical vectors', () => {
-  const v = { music: 10, travel: 5 };
-  assert.ok(Math.abs(cosineSimilarity(v, v) - 1) < 1e-10);
-});
-
-test('cosineSimilarity returns 0 for orthogonal vectors', () => {
-  const a = { music: 1 };
-  const b = { sports: 1 };
-  assert.equal(cosineSimilarity(a, b), 0);
-});
-
-test('cosineSimilarity returns 0 for empty vector', () => {
-  assert.equal(cosineSimilarity({}, { music: 1 }), 0);
-});
-
-test('cosineSimilarity returns a value in [0, 1]', () => {
-  const a = { music: 8, travel: 3 };
-  const b = { music: 5, travel: 9, gaming: 2 };
-  const sim = cosineSimilarity(a, b);
-  assert.ok(sim >= 0 && sim <= 1, `Expected [0,1], got ${sim}`);
-});
-
-// ─── InterestGraph tests ──────────────────────────────────────────────────────
-
-test('InterestGraph recordSwipe like increases interest weight', () => {
+test('InterestGraph recordAction creates a symmetric edge', () => {
   const g = new InterestGraph();
-  g.recordSwipe('alice', 'bob', ['music', 'travel'], 'like');
-  const interests = g.getInterests('alice');
-  assert.ok(interests['music']! > 0);
-  assert.ok(interests['travel']! > 0);
+  g.recordAction('a', 'b', 'like');
+  assert.equal(g.getEdge('a', 'b'), 2);
+  assert.equal(g.getEdge('b', 'a'), 2);
 });
 
-test('InterestGraph recordSwipe superlike adds greater weight than like', () => {
+test('InterestGraph superlike weighs more than like', () => {
   const g = new InterestGraph();
-  g.recordSwipe('alice', 'bob', ['music'], 'superlike');
-  g.recordSwipe('alice', 'carol', ['travel'], 'like');
-  const interests = g.getInterests('alice');
-  assert.ok(interests['music']! > interests['travel']!);
+  g.recordAction('a', 'b', 'superlike');
+  assert.equal(g.getEdge('a', 'b'), 5);
 });
 
-test('InterestGraph recordSwipe skip reduces interest weight', () => {
+test('InterestGraph skip does not create an edge on its own', () => {
   const g = new InterestGraph();
-  g.recordSwipe('alice', 'bob', ['sports'], 'skip');
-  const interests = g.getInterests('alice');
-  assert.ok(interests['sports']! < 0);
+  g.recordAction('a', 'b', 'skip');
+  assert.equal(g.getEdge('a', 'b'), 0);
 });
 
-test('InterestGraph getSimilarity returns 0 for users with no common interests', () => {
+test('InterestGraph skip after like reduces weight but keeps edge until 0', () => {
   const g = new InterestGraph();
-  g.recordSwipe('alice', 'x', ['music'], 'like');
-  g.recordSwipe('bob', 'y', ['sports'], 'like');
-  assert.equal(g.getSimilarity('alice', 'bob'), 0);
+  g.recordAction('a', 'b', 'like');
+  g.recordAction('a', 'b', 'skip');
+  // weight = max(0, 2-1) = 1
+  assert.equal(g.getEdge('a', 'b'), 1);
+  g.recordAction('a', 'b', 'skip');
+  // now 0 → edge removed
+  assert.equal(g.getEdge('a', 'b'), 0);
+  assert.equal(g.neighbours('a').size, 0);
 });
 
-test('InterestGraph getSimilarity returns >0 for users with shared interests', () => {
+test('InterestGraph neighbours returns a defensive copy', () => {
   const g = new InterestGraph();
-  g.recordSwipe('alice', 'x', ['music', 'travel'], 'like');
-  g.recordSwipe('bob', 'y', ['music', 'travel'], 'like');
-  const sim = g.getSimilarity('alice', 'bob');
-  assert.ok(sim > 0, `Expected positive similarity, got ${sim}`);
+  g.recordAction('a', 'b', 'like');
+  const n = g.neighbours('a');
+  n.set('b', 9999);
+  assert.equal(g.getEdge('a', 'b'), 2);
 });
 
-test('InterestGraph getRecommendations excludes self', () => {
+test('InterestGraph getRecommendations finds two-hop candidates', () => {
   const g = new InterestGraph();
-  g.recordSwipe('alice', 'target1', ['music'], 'like');
-  g.recordSwipe('alice', 'target2', ['travel'], 'like');
-  const recs = g.getRecommendations('alice', 10);
-  assert.ok(!recs.some((r) => r.userId === 'alice'), 'Self should not appear in recommendations');
+  // a ↔ b, b ↔ c, so c should be recommended to a.
+  g.recordAction('a', 'b', 'like');
+  g.recordAction('b', 'c', 'like');
+  const recs = g.getRecommendations('a', 5);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].userId, 'c');
+  assert.equal(recs[0].supportingPaths, 1);
 });
 
-test('InterestGraph getRecommendations excludes already-swiped users', () => {
+test('InterestGraph getRecommendations aggregates multiple paths', () => {
   const g = new InterestGraph();
-  g.seedInterests('alice', { music: 5 });
-  g.recordSwipe('alice', 'bob', ['music'], 'like'); // alice already swiped bob
-  g.seedInterests('bob', { music: 8 });
-
-  const recs = g.getRecommendations('alice', 10);
-  assert.ok(!recs.some((r) => r.userId === 'bob'), 'Already-swiped bob should not appear');
+  g.recordAction('a', 'b1', 'like');
+  g.recordAction('a', 'b2', 'like');
+  g.recordAction('b1', 'c', 'like');
+  g.recordAction('b2', 'c', 'like');
+  const recs = g.getRecommendations('a', 5);
+  assert.equal(recs.length, 1);
+  assert.equal(recs[0].userId, 'c');
+  assert.equal(recs[0].supportingPaths, 2);
 });
 
-test('InterestGraph getRecommendations returns top-N sorted by similarity', () => {
+test('InterestGraph getRecommendations excludes direct neighbours', () => {
   const g = new InterestGraph();
-  g.seedInterests('alice', { music: 10, travel: 8 });
-  g.seedInterests('bob', { music: 9, travel: 7 }); // high similarity
-  g.seedInterests('carol', { sports: 10 });          // zero similarity
+  g.recordAction('a', 'b', 'like');
+  g.recordAction('b', 'a', 'like'); // a already direct-edges to b
+  const recs = g.getRecommendations('a', 5);
+  assert.equal(recs.find((r) => r.userId === 'b'), undefined);
+});
 
-  const recs = g.getRecommendations('alice', 2);
-  if (recs.length >= 2) {
-    assert.ok(recs[0]!.similarity >= recs[1]!.similarity, 'Results should be sorted by similarity');
+test('InterestGraph getRecommendations truncates to count', () => {
+  const g = new InterestGraph();
+  g.recordAction('a', 'hub', 'like');
+  for (let i = 0; i < 10; i += 1) {
+    g.recordAction('hub', `c${i}`, 'like');
   }
+  const recs = g.getRecommendations('a', 3);
+  assert.equal(recs.length, 3);
 });
 
-test('InterestGraph getRecommendations respects count limit', () => {
+test('InterestGraph edgeCount tracks undirected edges', () => {
   const g = new InterestGraph();
-  for (let i = 0; i < 10; i++) {
-    g.seedInterests(`user${i}`, { music: i + 1 });
-  }
-  g.seedInterests('alice', { music: 5 });
-  const recs = g.getRecommendations('alice', 3);
-  assert.ok(recs.length <= 3);
+  g.recordAction('a', 'b', 'like');
+  g.recordAction('b', 'c', 'like');
+  assert.equal(g.edgeCount(), 2);
 });
 
-test('InterestGraph seedInterests accumulates weights', () => {
+test('InterestGraph topNeighbours returns neighbours in weight order', () => {
   const g = new InterestGraph();
-  g.seedInterests('alice', { music: 5 });
-  g.seedInterests('alice', { music: 3 });
-  const interests = g.getInterests('alice');
-  assert.equal(interests['music'], 8);
-});
-
-test('InterestGraph getAllUserIds lists known users', () => {
-  const g = new InterestGraph();
-  g.seedInterests('alice', { music: 1 });
-  g.seedInterests('bob', { travel: 1 });
-  const ids = g.getAllUserIds();
-  assert.ok(ids.includes('alice'));
-  assert.ok(ids.includes('bob'));
+  g.recordAction('a', 'b', 'like'); // weight 2
+  g.recordAction('a', 'c', 'superlike'); // weight 5
+  const top = g.topNeighbours('a', 10);
+  assert.equal(top[0].userId, 'c');
+  assert.equal(top[1].userId, 'b');
 });

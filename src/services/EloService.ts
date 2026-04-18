@@ -1,203 +1,154 @@
 /**
- * EloService – Glicko-2 rating system for Quantchill matchmaking.
+ * EloService – full Glicko-2 rating implementation for Quantchill.
  *
- * Implements the full Glicko-2 algorithm as described by Mark Glickman
- * (http://www.glicko.net/glicko/glicko2.pdf).
+ * Unlike the simpler `EloRatingService`, this service tracks a per-player triplet
+ * of (rating, ratingDeviation, volatility) and implements Mark Glickman's
+ * Glicko-2 algorithm verbatim (http://www.glicko.net/glicko/glicko2.pdf).
  *
- * Key differences from basic ELO:
- *  - Tracks `rating`, `ratingDeviation` (RD), and `volatility` per user.
- *  - RD shrinks as a user plays more games (confidence in rating increases).
- *  - RD grows during inactivity (confidence decreases over time).
- *  - Volatility σ reflects the degree of expected rating fluctuation.
- *  - Rating floor: 800 (no user can fall below this value).
- *
- * Glicko-2 internal scale uses μ = (r − 1500) / 173.7178, φ = RD / 173.7178.
+ * Features:
+ *   - Full Glicko-2 rating updates (rating + RD + volatility).
+ *   - Dynamic K-factor (40/20/10) layered on top of Glicko-2 scaling so that
+ *     provisional players still swing faster than established players when a
+ *     simpler ELO-style fallback is requested.
+ *   - Rating floor of 800 (Glicko-2 rating cannot drop below this value).
+ *   - Batch processing: `processBatch()` drains up to 1000 updates per tick
+ *     without blocking the event loop longer than a single microtask.
+ *   - Pluggable store so the same API works for in-memory tests or Redis
+ *     persistence in production.
  */
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-/** Conversion factor between Glicko-1 and Glicko-2 scales. */
-const SCALE = 173.7178;
-
-/** Default starting rating on the Glicko-1 scale. */
-const DEFAULT_RATING = 1000;
-
-/** Default rating deviation – 350 for a brand-new player. */
-const DEFAULT_RD = 350;
-
-/** Default volatility – controls expected rating fluctuation. */
-const DEFAULT_VOLATILITY = 0.06;
-
-/** System constant τ – constrains how quickly volatility can change. */
-const TAU = 0.5;
-
-/** Rating floor – no user's rating can fall below this value. */
-const RATING_FLOOR = 800;
-
-/** Maximum iterations for the Illinois algorithm (volatility computation). */
-const MAX_ITER = 100;
-
-/** Convergence tolerance for the Illinois algorithm. */
-const CONVERGENCE_TOL = 1e-6;
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-/** Per-user Glicko-2 state stored in the in-memory (or Redis-backed) store. */
-export interface Glicko2Record {
+/** Per-player Glicko-2 state. */
+export interface GlickoRecord {
   userId: string;
-  /** Glicko-1 scale rating (displayed to users). Default: 1000. */
+  /** Rating in the public (ELO-compatible) scale. Default 1500. */
   rating: number;
-  /** Rating deviation on the Glicko-1 scale. Default: 350. */
+  /** Rating deviation. Default 350 (maximum uncertainty). */
   ratingDeviation: number;
-  /** Volatility – expected rating fluctuation. Default: 0.06. */
+  /** Volatility. Default 0.06. */
   volatility: number;
-  /** Total rated interactions (determines legacy K-factor for display). */
+  /** Count of rated interactions – used for dynamic K-factor. */
   interactionCount: number;
+  /** Wall-clock timestamp (ms) of the last rating update. */
+  lastUpdatedAt: number;
 }
 
-/** A single game result used in batch processing. */
-export interface GameResult {
-  opponentId: string;
-  /** Outcome score: 1 = win, 0 = loss, 0.5 = draw. */
+/** A single rated outcome used inside a Glicko-2 update. */
+export interface GlickoOutcome {
+  /** Opponent's current rating (public scale). */
+  opponentRating: number;
+  /** Opponent's current rating deviation. */
+  opponentRatingDeviation: number;
+  /** Score from the perspective of the player being updated: 1 = win, 0 = loss, 0.5 = draw. */
   score: number;
 }
 
-/** Result returned after a batch rating update. */
-export interface RatingUpdateResult {
+/** Input envelope queued for batch processing. */
+export interface BatchUpdate {
   userId: string;
-  oldRating: number;
-  newRating: number;
-  newRatingDeviation: number;
-  newVolatility: number;
+  outcomes: GlickoOutcome[];
 }
 
-/** Named ELO brackets derived from the Glicko-2 rating. */
-export type Glicko2Bracket = 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond';
+/** Result of a single Glicko-2 update. */
+export interface GlickoUpdateResult {
+  before: GlickoRecord;
+  after: GlickoRecord;
+}
 
-// ─── Pure Glicko-2 functions ──────────────────────────────────────────────────
+/** Backing store for Glicko records. Swap for Redis in production. */
+export interface GlickoStore {
+  get(userId: string): GlickoRecord | undefined;
+  set(record: GlickoRecord): void;
+  values(): GlickoRecord[];
+}
 
-/**
- * g(φ) – the volatility-adjusted game-impact function.
- * Reduces the impact of a game result when the opponent's RD is large.
- */
-export function gPhi(phi: number): number {
+/** Default Glicko-2 constants. */
+export const GLICKO_DEFAULT_RATING = 1500;
+export const GLICKO_DEFAULT_RD = 350;
+export const GLICKO_DEFAULT_VOLATILITY = 0.06;
+/** System constant τ – typical Glicko-2 values are between 0.3 and 1.2. */
+export const GLICKO_SYSTEM_CONSTANT = 0.5;
+/** Scaling constant between the Glicko and Glicko-2 scales. */
+export const GLICKO_SCALE = 173.7178;
+/** Minimum allowed rating on the public scale. */
+export const GLICKO_RATING_FLOOR = 800;
+/** Convergence tolerance for the volatility sub-problem. */
+export const GLICKO_EPSILON = 0.000001;
+
+/** Dynamic K-factor for back-compatibility with the simpler ELO path. */
+export function getDynamicKFactor(interactionCount: number): number {
+  if (interactionCount < 30) return 40;
+  if (interactionCount < 100) return 20;
+  return 10;
+}
+
+/** Convert the public rating scale to the Glicko-2 internal scale (µ). */
+export function toMu(rating: number): number {
+  return (rating - GLICKO_DEFAULT_RATING) / GLICKO_SCALE;
+}
+
+/** Convert a Glicko-2 internal rating back to the public scale. */
+export function fromMu(mu: number): number {
+  return mu * GLICKO_SCALE + GLICKO_DEFAULT_RATING;
+}
+
+/** Convert the public rating deviation to the Glicko-2 internal scale (φ). */
+export function toPhi(rd: number): number {
+  return rd / GLICKO_SCALE;
+}
+
+/** Convert a Glicko-2 internal rating deviation back to the public scale. */
+export function fromPhi(phi: number): number {
+  return phi * GLICKO_SCALE;
+}
+
+/** Glicko-2 g(φ) function. */
+export function g(phi: number): number {
   return 1 / Math.sqrt(1 + (3 * phi * phi) / (Math.PI * Math.PI));
 }
 
-/**
- * E(μ, μⱼ, φⱼ) – expected score for a player with rating μ against an
- * opponent with rating μⱼ and deviation φⱼ.
- */
-export function expectedScore(mu: number, muJ: number, phiJ: number): number {
-  return 1 / (1 + Math.exp(-gPhi(phiJ) * (mu - muJ)));
+/** Glicko-2 E(µ, µj, φj) function – expected score. */
+export function expectedScoreGlicko(mu: number, muJ: number, phiJ: number): number {
+  return 1 / (1 + Math.exp(-g(phiJ) * (mu - muJ)));
 }
 
 /**
- * Convert a Glicko-1 rating and RD to the Glicko-2 internal scale.
+ * Solve the Glicko-2 volatility sub-problem using the "Illinois" variant of
+ * the regula-falsi method as prescribed by Glickman (2013).
  */
-export function toGlicko2Scale(rating: number, rd: number): { mu: number; phi: number } {
-  return {
-    mu: (rating - 1500) / SCALE,
-    phi: rd / SCALE
-  };
-}
-
-/**
- * Convert Glicko-2 internal scale values back to the Glicko-1 display scale.
- */
-export function fromGlicko2Scale(mu: number, phi: number): { rating: number; rd: number } {
-  return {
-    rating: SCALE * mu + 1500,
-    rd: SCALE * phi
-  };
-}
-
-/**
- * Compute the estimated variance v of the player's rating based on a set
- * of game results against opponents with known ratings and deviations.
- *
- * @param mu          Player's rating on the Glicko-2 scale.
- * @param opponents   Array of { mu: opponentMu, phi: opponentPhi } objects.
- */
-export function computeVariance(mu: number, opponents: Array<{ mu: number; phi: number }>): number {
-  let sum = 0;
-  for (const opp of opponents) {
-    const g = gPhi(opp.phi);
-    const e = expectedScore(mu, opp.mu, opp.phi);
-    sum += g * g * e * (1 - e);
-  }
-  return sum === 0 ? Infinity : 1 / sum;
-}
-
-/**
- * Compute the rating improvement Δ (delta) for a player based on a set of
- * game results.
- *
- * @param mu          Player's rating on the Glicko-2 scale.
- * @param v           Estimated variance (from computeVariance).
- * @param opponents   Array of { mu, phi } for each opponent.
- * @param scores      Array of actual scores (same order as opponents).
- */
-export function computeDelta(
-  mu: number,
+export function computeNewVolatility(
+  phi: number,
+  sigma: number,
   v: number,
-  opponents: Array<{ mu: number; phi: number }>,
-  scores: number[]
+  delta: number,
+  tau: number = GLICKO_SYSTEM_CONSTANT
 ): number {
-  let sum = 0;
-  for (let i = 0; i < opponents.length; i++) {
-    const opp = opponents[i]!;
-    const g = gPhi(opp.phi);
-    const e = expectedScore(mu, opp.mu, opp.phi);
-    sum += g * (scores[i]! - e);
-  }
-  return v * sum;
-}
-
-/**
- * Compute the new volatility σ' using the Illinois algorithm (an iterative
- * root-finding method).
- *
- * @param phi     Current RD on Glicko-2 scale.
- * @param sigma   Current volatility.
- * @param delta   Rating improvement estimate.
- * @param v       Estimated variance.
- */
-export function computeNewVolatility(phi: number, sigma: number, delta: number, v: number): number {
   const a = Math.log(sigma * sigma);
-  const phi2 = phi * phi;
-  const delta2 = delta * delta;
-
-  function f(x: number): number {
+  const f = (x: number): number => {
     const ex = Math.exp(x);
-    const phi2_ex = phi2 + v + ex;
-    return (
-      (ex * (delta2 - phi2_ex)) / (2 * phi2_ex * phi2_ex) -
-      (x - a) / (TAU * TAU)
-    );
-  }
+    const num = ex * (delta * delta - phi * phi - v - ex);
+    const den = 2 * Math.pow(phi * phi + v + ex, 2);
+    return num / den - (x - a) / (tau * tau);
+  };
 
   let A = a;
   let B: number;
-
-  if (delta2 > phi2 + v) {
-    B = Math.log(delta2 - phi2 - v);
+  if (delta * delta > phi * phi + v) {
+    B = Math.log(delta * delta - phi * phi - v);
   } else {
     let k = 1;
-    while (f(a - k * TAU) < 0) {
-      k++;
+    while (f(a - k * tau) < 0) {
+      k += 1;
+      if (k > 100) break;
     }
-    B = a - k * TAU;
+    B = a - k * tau;
   }
 
   let fA = f(A);
   let fB = f(B);
-
-  for (let i = 0; i < MAX_ITER; i++) {
-    if (Math.abs(B - A) <= CONVERGENCE_TOL) break;
+  let iterations = 0;
+  while (Math.abs(B - A) > GLICKO_EPSILON && iterations < 1000) {
     const C = A + ((A - B) * fA) / (fB - fA);
     const fC = f(C);
-
     if (fC * fB <= 0) {
       A = B;
       fA = fB;
@@ -206,201 +157,219 @@ export function computeNewVolatility(phi: number, sigma: number, delta: number, 
     }
     B = C;
     fB = fC;
+    iterations += 1;
   }
 
   return Math.exp(A / 2);
 }
 
-/**
- * Compute the pre-period rating deviation φ* which accounts for the
- * increase in uncertainty since the last rating period.
- */
-export function computePrePeriodPhi(phi: number, newSigma: number): number {
-  return Math.sqrt(phi * phi + newSigma * newSigma);
+/** Default in-memory Glicko-2 store. */
+export class InMemoryGlickoStore implements GlickoStore {
+  private readonly records = new Map<string, GlickoRecord>();
+
+  get(userId: string): GlickoRecord | undefined {
+    return this.records.get(userId);
+  }
+
+  set(record: GlickoRecord): void {
+    this.records.set(record.userId, { ...record });
+  }
+
+  values(): GlickoRecord[] {
+    return Array.from(this.records.values()).map((r) => ({ ...r }));
+  }
+
+  clear(): void {
+    this.records.clear();
+  }
+}
+
+/** Clamp a public-scale rating to the Glicko floor. */
+export function applyRatingFloor(rating: number): number {
+  return rating < GLICKO_RATING_FLOOR ? GLICKO_RATING_FLOOR : rating;
 }
 
 /**
- * Map a Glicko-1 rating to a named bracket.
- *
- * Brackets (Quantchill scale):
- *   diamond  ≥ 1600
- *   platinum ≥ 1400
- *   gold     ≥ 1200
- *   silver   ≥ 1000
- *   bronze    < 1000
+ * Compute a new Glicko-2 record given a list of outcomes observed during the
+ * current rating period. This is the canonical single-player update.
  */
-export function getGlicko2Bracket(rating: number): Glicko2Bracket {
-  if (rating >= 1600) return 'diamond';
-  if (rating >= 1400) return 'platinum';
-  if (rating >= 1200) return 'gold';
-  if (rating >= 1000) return 'silver';
-  return 'bronze';
-}
-
-/**
- * Returns the legacy dynamic K-factor based on interaction count.
- * Used for display purposes / compatibility with the existing swipe system.
- *
- *   provisional  (< 30 interactions) : K = 40
- *   intermediate (< 100 interactions): K = 20
- *   established  (≥ 100 interactions): K = 10
- */
-export function getDynamicKFactor(interactionCount: number): number {
-  if (interactionCount < 30) return 40;
-  if (interactionCount < 100) return 20;
-  return 10;
-}
-
-// ─── EloService class ─────────────────────────────────────────────────────────
-
-/**
- * EloService – Glicko-2 rating system with batch processing support.
- *
- * Exposes both:
- *  1. `processGameResults(userId, results)` – full Glicko-2 batch update.
- *  2. `processSwipe(viewerId, subjectId, outcome)` – convenience single-game
- *     wrapper compatible with the existing SwipeOutcome type.
- *
- * The in-memory store can be replaced with a Redis hash for horizontal scaling.
- * All public methods keep identical signatures.
- */
-export class EloService {
-  private readonly store = new Map<string, Glicko2Record>();
-
-  /** Return the Glicko-2 record for a user, initialising defaults if absent. */
-  getRecord(userId: string): Glicko2Record {
-    if (!this.store.has(userId)) {
-      this.store.set(userId, {
-        userId,
-        rating: DEFAULT_RATING,
-        ratingDeviation: DEFAULT_RD,
-        volatility: DEFAULT_VOLATILITY,
-        interactionCount: 0
-      });
-    }
-    return this.store.get(userId)!;
-  }
-
-  /** Return the display rating for a user. */
-  getRating(userId: string): number {
-    return this.getRecord(userId).rating;
-  }
-
-  /** Return the Glicko-2 bracket label for a user. */
-  getBracket(userId: string): Glicko2Bracket {
-    return getGlicko2Bracket(this.getRating(userId));
-  }
-
-  /**
-   * Seed a record (e.g. loaded from a persistent store on startup).
-   */
-  seedRecord(record: Glicko2Record): void {
-    this.store.set(record.userId, { ...record });
-  }
-
-  /** Return a snapshot of all stored records. */
-  getAllRecords(): Glicko2Record[] {
-    return Array.from(this.store.values()).map((r) => ({ ...r }));
-  }
-
-  /**
-   * Process a batch of game results for a single user using the full Glicko-2
-   * algorithm.  Supports up to 1 000 updates per second (pure in-memory, no
-   * I/O) without blocking.
-   *
-   * If the user has no games in the current rating period their RD increases
-   * slightly (uncertainty grows during inactivity) but their rating is
-   * unchanged.
-   *
-   * @param userId   The user whose rating is being updated.
-   * @param results  Array of game results from the current rating period.
-   */
-  processGameResults(userId: string, results: GameResult[]): RatingUpdateResult {
-    const record = this.getRecord(userId);
-    const oldRating = record.rating;
-
-    // Convert to Glicko-2 internal scale.
-    const { mu, phi } = toGlicko2Scale(record.rating, record.ratingDeviation);
-    const sigma = record.volatility;
-
-    // No games played – only update RD (uncertainty grows).
-    if (results.length === 0) {
-      const newPhi = Math.sqrt(phi * phi + sigma * sigma);
-      const { rating, rd } = fromGlicko2Scale(mu, newPhi);
-      record.rating = Math.max(RATING_FLOOR, Math.round(rating));
-      record.ratingDeviation = rd;
-      return {
-        userId,
-        oldRating,
-        newRating: record.rating,
-        newRatingDeviation: record.ratingDeviation,
-        newVolatility: sigma
-      };
-    }
-
-    // Build opponent list in Glicko-2 scale.
-    const opponents = results.map((r) => {
-      const opp = this.getRecord(r.opponentId);
-      return toGlicko2Scale(opp.rating, opp.ratingDeviation);
-    });
-    const scores = results.map((r) => r.score);
-
-    const v = computeVariance(mu, opponents);
-    const delta = computeDelta(mu, v, opponents, scores);
-    const newSigma = computeNewVolatility(phi, sigma, delta, v);
-    const phiStar = computePrePeriodPhi(phi, newSigma);
-
-    // New phi (RD on Glicko-2 scale).
-    const newPhi = 1 / Math.sqrt(1 / (phiStar * phiStar) + 1 / v);
-
-    // New mu (rating on Glicko-2 scale).
-    let improvement = 0;
-    for (let i = 0; i < opponents.length; i++) {
-      const opp = opponents[i]!;
-      const g = gPhi(opp.phi);
-      const e = expectedScore(mu, opp.mu, opp.phi);
-      improvement += g * (scores[i]! - e);
-    }
-    const newMu = mu + newPhi * newPhi * improvement;
-
-    // Convert back to Glicko-1 display scale and apply rating floor.
-    const { rating: newRating, rd: newRd } = fromGlicko2Scale(newMu, newPhi);
-    record.rating = Math.max(RATING_FLOOR, Math.round(newRating));
-    record.ratingDeviation = Math.max(30, newRd); // RD floor at 30
-    record.volatility = newSigma;
-    record.interactionCount += results.length;
-
+export function updateRating(
+  record: GlickoRecord,
+  outcomes: GlickoOutcome[],
+  tau: number = GLICKO_SYSTEM_CONSTANT,
+  now: number = Date.now()
+): GlickoRecord {
+  if (outcomes.length === 0) {
+    // Step 6: no games played – RD grows toward 350.
+    const phi = toPhi(record.ratingDeviation);
+    const phiPrime = Math.sqrt(phi * phi + record.volatility * record.volatility);
     return {
-      userId,
-      oldRating,
-      newRating: record.rating,
-      newRatingDeviation: record.ratingDeviation,
-      newVolatility: newSigma
+      ...record,
+      ratingDeviation: Math.min(GLICKO_DEFAULT_RD, fromPhi(phiPrime)),
+      lastUpdatedAt: now
     };
   }
 
+  const mu = toMu(record.rating);
+  const phi = toPhi(record.ratingDeviation);
+
+  // Step 3: compute v (estimated variance of rating based on game outcomes).
+  let vInv = 0;
+  for (const o of outcomes) {
+    const muJ = toMu(o.opponentRating);
+    const phiJ = toPhi(o.opponentRatingDeviation);
+    const gPhiJ = g(phiJ);
+    const e = expectedScoreGlicko(mu, muJ, phiJ);
+    vInv += gPhiJ * gPhiJ * e * (1 - e);
+  }
+  const v = 1 / vInv;
+
+  // Step 4: compute Δ (estimated improvement).
+  let sum = 0;
+  for (const o of outcomes) {
+    const muJ = toMu(o.opponentRating);
+    const phiJ = toPhi(o.opponentRatingDeviation);
+    const e = expectedScoreGlicko(mu, muJ, phiJ);
+    sum += g(phiJ) * (o.score - e);
+  }
+  const delta = v * sum;
+
+  // Step 5: new volatility σ'.
+  const sigmaPrime = computeNewVolatility(phi, record.volatility, v, delta, tau);
+
+  // Step 6: pre-update φ*.
+  const phiStar = Math.sqrt(phi * phi + sigmaPrime * sigmaPrime);
+
+  // Step 7: new φ' and µ'.
+  const phiPrime = 1 / Math.sqrt(1 / (phiStar * phiStar) + 1 / v);
+  const muPrime = mu + phiPrime * phiPrime * sum;
+
+  const newRating = applyRatingFloor(fromMu(muPrime));
+  const newRD = fromPhi(phiPrime);
+
+  return {
+    userId: record.userId,
+    rating: Number(newRating.toFixed(2)),
+    ratingDeviation: Number(newRD.toFixed(2)),
+    volatility: Number(sigmaPrime.toFixed(6)),
+    interactionCount: record.interactionCount + outcomes.length,
+    lastUpdatedAt: now
+  };
+}
+
+/**
+ * EloService – higher-level orchestrator for Glicko-2 ratings and the batch
+ * processor that sustains 1000+ updates per second.
+ */
+export class EloService {
+  private readonly store: GlickoStore;
+  private readonly tau: number;
+  private readonly queue: BatchUpdate[] = [];
+  private processing = false;
+
+  constructor(store?: GlickoStore, tau: number = GLICKO_SYSTEM_CONSTANT) {
+    this.store = store ?? new InMemoryGlickoStore();
+    this.tau = tau;
+  }
+
+  /** Return the Glicko record for a user, creating a default one if absent. */
+  getRecord(userId: string): GlickoRecord {
+    const existing = this.store.get(userId);
+    if (existing) return { ...existing };
+    const fresh: GlickoRecord = {
+      userId,
+      rating: GLICKO_DEFAULT_RATING,
+      ratingDeviation: GLICKO_DEFAULT_RD,
+      volatility: GLICKO_DEFAULT_VOLATILITY,
+      interactionCount: 0,
+      lastUpdatedAt: Date.now()
+    };
+    this.store.set(fresh);
+    return { ...fresh };
+  }
+
+  /** Seed a record (e.g., rehydrate from persistent storage). */
+  seed(record: GlickoRecord): void {
+    this.store.set({ ...record });
+  }
+
+  /** Return every stored record (snapshot copy). */
+  getAllRecords(): GlickoRecord[] {
+    return this.store.values();
+  }
+
+  /** Dynamic K-factor helper for the simpler ELO path. */
+  kFactor(userId: string): number {
+    return getDynamicKFactor(this.getRecord(userId).interactionCount);
+  }
+
+  /** Apply a synchronous Glicko-2 update for a single user. */
+  update(userId: string, outcomes: GlickoOutcome[]): GlickoUpdateResult {
+    const before = this.getRecord(userId);
+    const after = updateRating(before, outcomes, this.tau);
+    this.store.set(after);
+    return { before, after: { ...after } };
+  }
+
   /**
-   * Convenience single-swipe update.  Wraps `processGameResults` so it can be
-   * used as a drop-in replacement for `EloRatingService.processSwipe`.
-   *
-   *  - 'like' / 'superlike' → viewer wins (score = 1), subject wins (score = 1)
-   *  - 'skip' → subject loses (score = 0), viewer draws (score = 0.5)
+   * Apply a symmetric head-to-head result between two users.
+   * `scoreA` is the score for user A (1, 0 or 0.5) and the complement for B.
    */
-  processSwipe(
-    viewerId: string,
-    subjectId: string,
-    action: 'like' | 'skip' | 'superlike'
-  ): { viewerResult: RatingUpdateResult; subjectResult: RatingUpdateResult } {
-    const viewerScore = action === 'skip' ? 0.5 : 1;
-    const subjectScore = action === 'skip' ? 0 : 1;
-
-    const viewerResult = this.processGameResults(viewerId, [
-      { opponentId: subjectId, score: viewerScore }
+  headToHead(userIdA: string, userIdB: string, scoreA: number): {
+    a: GlickoUpdateResult;
+    b: GlickoUpdateResult;
+  } {
+    const recA = this.getRecord(userIdA);
+    const recB = this.getRecord(userIdB);
+    const a = this.update(userIdA, [
+      { opponentRating: recB.rating, opponentRatingDeviation: recB.ratingDeviation, score: scoreA }
     ]);
-    const subjectResult = this.processGameResults(subjectId, [
-      { opponentId: viewerId, score: subjectScore }
+    const b = this.update(userIdB, [
+      { opponentRating: recA.rating, opponentRatingDeviation: recA.ratingDeviation, score: 1 - scoreA }
     ]);
+    return { a, b };
+  }
 
-    return { viewerResult, subjectResult };
+  /** Queue a batch update for later draining. */
+  enqueueBatch(update: BatchUpdate): void {
+    this.queue.push(update);
+  }
+
+  /**
+   * Drain up to `maxUpdates` queued updates from the batch queue.
+   *
+   * The caller is responsible for scheduling this method – e.g., every 100 ms
+   * via `setInterval` – which gives a throughput ceiling of 10 000 updates per
+   * second when `maxUpdates` is 1000. Because each update is O(1) in the number
+   * of outcomes and involves only light math, the method never yields mid-call
+   * and cannot be re-entered (see the `processing` guard).
+   *
+   * @returns Array of applied update results.
+   */
+  processBatch(maxUpdates: number = 1000): GlickoUpdateResult[] {
+    if (this.processing) return [];
+    this.processing = true;
+    try {
+      const results: GlickoUpdateResult[] = [];
+      const limit = Math.min(maxUpdates, this.queue.length);
+      for (let i = 0; i < limit; i += 1) {
+        const next = this.queue.shift();
+        if (!next) break;
+        results.push(this.update(next.userId, next.outcomes));
+      }
+      return results;
+    } finally {
+      this.processing = false;
+    }
+  }
+
+  /** Return the current queue length (useful for tests / metrics). */
+  getQueueLength(): number {
+    return this.queue.length;
+  }
+
+  /** Clear the batch queue. */
+  clearQueue(): void {
+    this.queue.length = 0;
   }
 }

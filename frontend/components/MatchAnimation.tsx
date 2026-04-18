@@ -1,260 +1,223 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useEffect, useRef } from 'react';
+import { motion } from 'framer-motion';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
+/**
+ * Match explosion animation.
+ *
+ * When two users match, two avatars fly toward the centre of the screen and
+ * collide, triggering a canvas-driven confetti / spark particle burst. A short
+ * Web Audio API sine sweep plays as the "match" SFX.
+ *
+ * The caller controls the lifecycle by mounting/unmounting the component. When
+ * mounted, the animation plays once and calls `onComplete` after
+ * `durationMs` milliseconds (default 2400).
+ */
 export interface MatchAnimationProps {
-  userAvatar?: string;
-  matchAvatar?: string;
-  userName?: string;
-  matchName?: string;
-  onDismiss?: () => void;
-  /** Duration in ms before the animation auto-dismisses. Default: 4000. */
-  autoDismissMs?: number;
+  leftAvatarUrl?: string;
+  rightAvatarUrl?: string;
+  leftName?: string;
+  rightName?: string;
+  durationMs?: number;
+  soundEnabled?: boolean;
+  onComplete?: () => void;
 }
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const PARTICLE_COUNT = 80;
-const CANVAS_SIZE = 400;
 
 interface Particle {
   x: number;
   y: number;
   vx: number;
   vy: number;
-  radius: number;
-  color: string;
-  alpha: number;
-  decay: number;
+  life: number;
+  maxLife: number;
+  hue: number;
+  size: number;
 }
 
-const PARTICLE_COLORS = [
-  '#f97316', '#facc15', '#4ade80', '#60a5fa',
-  '#c084fc', '#fb7185', '#34d399', '#fbbf24'
-];
+const PARTICLE_COUNT = 140;
 
-// ─── Canvas confetti renderer ─────────────────────────────────────────────────
-
-function spawnParticles(cx: number, cy: number): Particle[] {
-  return Array.from({ length: PARTICLE_COUNT }, () => {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 2 + Math.random() * 8;
-    return {
-      x: cx,
-      y: cy,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
-      radius: 2 + Math.random() * 5,
-      color: PARTICLE_COLORS[Math.floor(Math.random() * PARTICLE_COLORS.length)]!,
-      alpha: 1,
-      decay: 0.012 + Math.random() * 0.018
-    };
-  });
-}
-
-function useCanvasAnimation(active: boolean) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const particlesRef = useRef<Particle[]>([]);
-  const rafRef = useRef<number>(0);
+export default function MatchAnimation({
+  leftAvatarUrl,
+  rightAvatarUrl,
+  leftName = 'You',
+  rightName = 'Match',
+  durationMs = 2400,
+  soundEnabled = true,
+  onComplete
+}: MatchAnimationProps) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
-    if (!active) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const cx = CANVAS_SIZE / 2;
-    const cy = CANVAS_SIZE / 2;
-    particlesRef.current = spawnParticles(cx, cy);
+    const dpr = window.devicePixelRatio || 1;
+    const resize = () => {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    resize();
+    window.addEventListener('resize', resize);
 
-    function draw() {
-      if (!ctx || !canvas) return;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const particles: Particle[] = [];
+    let collided = false;
+    const startedAt = performance.now();
+    const collisionAt = 900; // ms into the animation
 
-      particlesRef.current = particlesRef.current.filter((p) => p.alpha > 0.01);
-
-      for (const p of particlesRef.current) {
-        ctx.save();
-        ctx.globalAlpha = p.alpha;
-        ctx.fillStyle = p.color;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-
-        p.x += p.vx;
-        p.y += p.vy;
-        p.vy += 0.12; // gravity
-        p.vx *= 0.98;  // drag
-        p.alpha -= p.decay;
-      }
-
-      if (particlesRef.current.length > 0) {
-        rafRef.current = requestAnimationFrame(draw);
+    function spawnParticles(cx: number, cy: number) {
+      for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+        const angle = (Math.PI * 2 * i) / PARTICLE_COUNT + Math.random() * 0.4;
+        const speed = 2 + Math.random() * 5;
+        particles.push({
+          x: cx,
+          y: cy,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life: 0,
+          maxLife: 60 + Math.random() * 40,
+          hue: Math.floor(180 + Math.random() * 160),
+          size: 2 + Math.random() * 3
+        });
       }
     }
 
-    rafRef.current = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [active]);
+    let rafId = 0;
+    function frame() {
+      const now = performance.now();
+      const elapsed = now - startedAt;
+      const rect = canvas!.getBoundingClientRect();
+      const cx = rect.width / 2;
+      const cy = rect.height / 2;
 
-  return canvasRef;
-}
+      ctx!.clearRect(0, 0, rect.width, rect.height);
 
-// ─── Web Audio API "match" chime ──────────────────────────────────────────────
+      if (!collided && elapsed >= collisionAt) {
+        collided = true;
+        spawnParticles(cx, cy);
+      }
 
-function playMatchSound() {
-  try {
-    const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-    const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
+      if (collided) {
+        for (const p of particles) {
+          p.life += 1;
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vy += 0.08; // gravity
+          p.vx *= 0.99;
+          p.vy *= 0.99;
+          const alpha = Math.max(0, 1 - p.life / p.maxLife);
+          ctx!.fillStyle = `hsla(${p.hue}, 95%, 65%, ${alpha.toFixed(3)})`;
+          ctx!.beginPath();
+          ctx!.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          ctx!.fill();
+        }
+      }
 
-    notes.forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = freq;
-      osc.type = 'sine';
-      const start = ctx.currentTime + i * 0.1;
-      gain.gain.setValueAtTime(0.18, start);
-      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.4);
-      osc.start(start);
-      osc.stop(start + 0.45);
-    });
-  } catch {
-    // Web Audio not available (SSR or restricted environment).
-  }
-}
+      if (elapsed < durationMs) {
+        rafId = requestAnimationFrame(frame);
+      } else {
+        onComplete?.();
+      }
+    }
+    rafId = requestAnimationFrame(frame);
 
-// ─── Avatar component ─────────────────────────────────────────────────────────
+    // Sound effect – Web Audio API short sine sweep.
+    let audioCtx: AudioContext | null = null;
+    if (soundEnabled && typeof window !== 'undefined') {
+      try {
+        type WebkitWindow = Window & { webkitAudioContext?: typeof AudioContext };
+        const Ctor = window.AudioContext ?? (window as WebkitWindow).webkitAudioContext;
+        if (Ctor) {
+          audioCtx = new Ctor();
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+          osc.frequency.linearRampToValueAtTime(880, audioCtx.currentTime + 0.25);
+          gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.4, audioCtx.currentTime + 0.05);
+          gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.6);
+          osc.connect(gain).connect(audioCtx.destination);
+          osc.start();
+          osc.stop(audioCtx.currentTime + 0.7);
+        }
+      } catch {
+        audioCtx = null;
+      }
+    }
 
-function Avatar({ src, name, delay }: { src?: string; name?: string; delay: number }) {
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', resize);
+      if (audioCtx) {
+        audioCtx.close().catch(() => undefined);
+      }
+    };
+  }, [durationMs, onComplete, soundEnabled]);
+
   return (
-    <motion.div
-      initial={{ scale: 0, opacity: 0 }}
-      animate={{ scale: 1, opacity: 1 }}
-      transition={{ type: 'spring', stiffness: 260, damping: 18, delay }}
-      className="w-28 h-28 rounded-full overflow-hidden border-4 border-white/30 bg-white/10 flex items-center justify-center shadow-xl"
+    <div
+      role="dialog"
+      aria-label="match-animation"
+      aria-live="polite"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
     >
-      {src ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={src} alt={name ?? 'avatar'} className="w-full h-full object-cover" />
-      ) : (
-        <span className="text-5xl">👤</span>
-      )}
-    </motion.div>
+      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
+
+      {/* Avatars flying toward the centre */}
+      <div className="relative flex h-40 w-full max-w-md items-center justify-center">
+        <motion.div
+          initial={{ x: '-120%', opacity: 0, scale: 0.7 }}
+          animate={{ x: '-10%', opacity: 1, scale: 1 }}
+          transition={{ type: 'spring', stiffness: 200, damping: 22 }}
+          className="relative z-10"
+        >
+          <AvatarBubble src={leftAvatarUrl} name={leftName} />
+        </motion.div>
+        <motion.div
+          initial={{ x: '120%', opacity: 0, scale: 0.7 }}
+          animate={{ x: '10%', opacity: 1, scale: 1 }}
+          transition={{ type: 'spring', stiffness: 200, damping: 22 }}
+          className="relative z-10"
+        >
+          <AvatarBubble src={rightAvatarUrl} name={rightName} />
+        </motion.div>
+      </div>
+
+      {/* Banner */}
+      <motion.h2
+        initial={{ opacity: 0, y: 30 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 1.0, duration: 0.6 }}
+        className="absolute bottom-24 text-4xl font-light tracking-[0.3em] text-fog text-glow-aurora"
+      >
+        IT&apos;S A MATCH
+      </motion.h2>
+    </div>
   );
 }
 
-// ─── MatchAnimation ───────────────────────────────────────────────────────────
-
-export default function MatchAnimation({
-  userAvatar,
-  matchAvatar,
-  userName = 'You',
-  matchName = 'Match',
-  onDismiss,
-  autoDismissMs = 4000
-}: MatchAnimationProps) {
-  const [visible, setVisible] = useState(true);
-  const canvasRef = useCanvasAnimation(visible);
-
-  const dismiss = useCallback(() => {
-    setVisible(false);
-    onDismiss?.();
-  }, [onDismiss]);
-
-  // Auto-dismiss.
-  useEffect(() => {
-    if (!visible) return;
-    playMatchSound();
-    const timer = setTimeout(dismiss, autoDismissMs);
-    return () => clearTimeout(timer);
-  }, [visible, autoDismissMs, dismiss]);
-
+function AvatarBubble({ src, name }: { src?: string; name: string }) {
+  if (src) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={src}
+        alt={name}
+        className="h-28 w-28 rounded-full border-4 border-aurora/60 object-cover shadow-xl"
+      />
+    );
+  }
   return (
-    <AnimatePresence>
-      {visible && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md"
-          onClick={dismiss}
-        >
-          {/* Particle canvas (centred behind avatars) */}
-          <canvas
-            ref={canvasRef}
-            width={CANVAS_SIZE}
-            height={CANVAS_SIZE}
-            className="absolute pointer-events-none"
-            style={{ width: CANVAS_SIZE, height: CANVAS_SIZE }}
-          />
-
-          {/* "It's a Match!" headline */}
-          <motion.h1
-            initial={{ y: -40, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ delay: 0.15, type: 'spring', stiffness: 200, damping: 18 }}
-            className="relative text-5xl font-black tracking-tight text-white mb-10 drop-shadow-lg"
-            style={{ textShadow: '0 0 30px #a78bfa88' }}
-          >
-            It&apos;s a Match! 🎉
-          </motion.h1>
-
-          {/* Avatars flying toward each other */}
-          <div className="relative flex items-center justify-center gap-6">
-            <motion.div
-              initial={{ x: -80, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              transition={{ delay: 0.3, type: 'spring', stiffness: 180, damping: 16 }}
-              className="flex flex-col items-center gap-2"
-            >
-              <Avatar src={userAvatar} name={userName} delay={0} />
-              <span className="text-white/80 text-sm font-medium">{userName}</span>
-            </motion.div>
-
-            {/* Heart between avatars */}
-            <motion.div
-              initial={{ scale: 0, rotate: -30 }}
-              animate={{ scale: [0, 1.4, 1], rotate: [0, 15, 0] }}
-              transition={{ delay: 0.55, duration: 0.5, ease: 'easeOut' }}
-              className="text-4xl"
-            >
-              💜
-            </motion.div>
-
-            <motion.div
-              initial={{ x: 80, opacity: 0 }}
-              animate={{ x: 0, opacity: 1 }}
-              transition={{ delay: 0.3, type: 'spring', stiffness: 180, damping: 16 }}
-              className="flex flex-col items-center gap-2"
-            >
-              <Avatar src={matchAvatar} name={matchName} delay={0.1} />
-              <span className="text-white/80 text-sm font-medium">{matchName}</span>
-            </motion.div>
-          </div>
-
-          {/* CTA */}
-          <motion.button
-            initial={{ y: 40, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ delay: 0.7, type: 'spring', stiffness: 200, damping: 18 }}
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            onClick={(e) => { e.stopPropagation(); dismiss(); }}
-            className="mt-10 px-8 py-3 rounded-full bg-gradient-to-r from-violet-500 to-pink-500 text-white font-bold text-lg shadow-xl"
-          >
-            Start Video Call 📹
-          </motion.button>
-
-          <p className="mt-4 text-white/30 text-xs">Tap anywhere to dismiss</p>
-        </motion.div>
-      )}
-    </AnimatePresence>
+    <div
+      aria-label={name}
+      className="flex h-28 w-28 items-center justify-center rounded-full border-4 border-aurora/60 bg-gradient-to-br from-aurora/40 to-teal/30 text-2xl font-semibold text-fog shadow-xl"
+    >
+      {name.slice(0, 1).toUpperCase()}
+    </div>
   );
 }

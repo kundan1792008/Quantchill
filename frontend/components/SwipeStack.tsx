@@ -1,329 +1,293 @@
 'use client';
 
-import { useState, useRef } from 'react';
 import {
+  PanInfo,
   motion,
   useMotionValue,
   useTransform,
-  useAnimation,
-  PanInfo
+  AnimatePresence
 } from 'framer-motion';
+import { useCallback, useMemo, useState } from 'react';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface CardData {
+/**
+ * A single card in the swipe stack. `videoStreamUrl` is optional – when omitted,
+ * a gradient placeholder is rendered so the component is usable in static SSR
+ * previews.
+ */
+export interface SwipeCard {
   id: string;
   name: string;
-  age?: number;
-  eloRating?: number;
-  tags?: string[];
-  avatarUrl?: string;
-  /** Active WebRTC stream (if video is live). */
-  stream?: MediaStream;
+  eloRating: number;
+  tags: string[];
+  videoStreamUrl?: string;
 }
 
+/** Direction of a completed swipe. */
+export type SwipeDirection = 'left' | 'right' | 'up';
+
+/** Public API for the component. */
 export interface SwipeStackProps {
-  cards: CardData[];
-  onLike?: (card: CardData) => void;
-  onSkip?: (card: CardData) => void;
-  onSuperlike?: (card: CardData) => void;
-  onEmpty?: () => void;
+  cards: SwipeCard[];
+  /** Called when the user completes a swipe gesture past the threshold. */
+  onSwipe?: (card: SwipeCard, direction: SwipeDirection) => void;
+  /** Number of cards visible behind the active card. Default 3. */
+  visibleDepth?: number;
+  /** Horizontal distance (px) at which a swipe is accepted. Default 140. */
+  horizontalThreshold?: number;
+  /** Vertical distance (px) at which a superlike swipe is accepted. Default 120. */
+  verticalThreshold?: number;
+  /** Velocity (px/s) that also triggers a swipe. Default 600. */
+  velocityThreshold?: number;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function eloBadgeColor(elo?: number): string {
-  if (!elo) return '#888';
-  if (elo >= 1600) return '#a78bfa'; // diamond – violet
-  if (elo >= 1400) return '#38bdf8'; // platinum – sky
-  if (elo >= 1200) return '#fbbf24'; // gold
-  if (elo >= 1000) return '#9ca3af'; // silver
-  return '#b45309';                   // bronze
-}
-
-function eloBracketLabel(elo?: number): string {
-  if (!elo) return '—';
-  if (elo >= 1600) return '💎 Diamond';
-  if (elo >= 1400) return '🌊 Platinum';
-  if (elo >= 1200) return '⭐ Gold';
-  if (elo >= 1000) return '🥈 Silver';
-  return '🥉 Bronze';
-}
-
-// ─── VideoCard ────────────────────────────────────────────────────────────────
-
-function VideoCard({ card }: { card: CardData }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-
-  // Attach MediaStream when the element mounts.
-  if (videoRef.current && card.stream) {
-    videoRef.current.srcObject = card.stream;
-  }
-
-  return (
-    <div className="relative w-full h-full rounded-3xl overflow-hidden bg-gray-900 select-none">
-      {card.stream ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          className="absolute inset-0 w-full h-full object-cover"
-        />
-      ) : (
-        <div className="absolute inset-0 flex items-center justify-center">
-          {card.avatarUrl ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={card.avatarUrl}
-              alt={card.name}
-              className="w-full h-full object-cover"
-            />
-          ) : (
-            <div className="text-6xl">👤</div>
-          )}
-        </div>
-      )}
-
-      {/* Gradient overlay */}
-      <div className="absolute inset-x-0 bottom-0 h-40 bg-gradient-to-t from-black/80 to-transparent" />
-
-      {/* Name & ELO */}
-      <div className="absolute bottom-4 left-4 right-4">
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-white text-2xl font-bold">{card.name}</span>
-          {card.age && (
-            <span className="text-white/70 text-lg">{card.age}</span>
-          )}
-        </div>
-
-        <div
-          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold"
-          style={{ backgroundColor: eloBadgeColor(card.eloRating) + '33', color: eloBadgeColor(card.eloRating) }}
-        >
-          {eloBracketLabel(card.eloRating)}
-          {card.eloRating && <span className="opacity-70 ml-1">({card.eloRating})</span>}
-        </div>
-
-        {card.tags && card.tags.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-2">
-            {card.tags.slice(0, 4).map((tag) => (
-              <span
-                key={tag}
-                className="px-2 py-0.5 rounded-full text-xs bg-white/10 text-white/80 backdrop-blur-sm"
-              >
-                {tag}
-              </span>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─── SwipeCard (individual draggable card) ────────────────────────────────────
-
-interface SwipeCardProps {
-  card: CardData;
-  stackIndex: number; // 0 = top, 1, 2 = behind
-  total: number;
-  onLike: (card: CardData, velocity: number) => void;
-  onSkip: (card: CardData, velocity: number) => void;
-  onSuperlike: (card: CardData, velocity: number) => void;
-}
-
-function SwipeCard({ card, stackIndex, onLike, onSkip, onSuperlike }: SwipeCardProps) {
-  const x = useMotionValue(0);
-  const y = useMotionValue(0);
-  const controls = useAnimation();
-
-  const rotate = useTransform(x, [-200, 0, 200], [-18, 0, 18]);
-  const likeOpacity = useTransform(x, [30, 120], [0, 1]);
-  const skipOpacity = useTransform(x, [-120, -30], [1, 0]);
-  const superlikeOpacity = useTransform(y, [-120, -40], [1, 0]);
-
-  const isTop = stackIndex === 0;
-
-  // Parallax: cards behind the top are scaled down and shifted up slightly.
-  const scale = 1 - stackIndex * 0.045;
-  const translateY = stackIndex * -12;
-
-  async function handleDragEnd(_: unknown, info: PanInfo) {
-    const velocityX = info.velocity.x;
-    const velocityY = info.velocity.y;
-    const offsetX = info.offset.x;
-    const offsetY = info.offset.y;
-
-    const SWIPE_THRESHOLD_X = 100;
-    const SWIPE_THRESHOLD_Y = -100;
-    const VELOCITY_THRESHOLD = 500;
-
-    if (offsetY < SWIPE_THRESHOLD_Y || velocityY < -VELOCITY_THRESHOLD) {
-      // Swipe up = superlike.
-      await controls.start({ y: -600, opacity: 0, transition: { duration: 0.35 } });
-      onSuperlike(card, Math.abs(velocityY));
-    } else if (offsetX > SWIPE_THRESHOLD_X || velocityX > VELOCITY_THRESHOLD) {
-      // Swipe right = like.
-      await controls.start({ x: 600, rotate: 20, opacity: 0, transition: { duration: 0.35 } });
-      onLike(card, velocityX);
-    } else if (offsetX < -SWIPE_THRESHOLD_X || velocityX < -VELOCITY_THRESHOLD) {
-      // Swipe left = skip.
-      await controls.start({ x: -600, rotate: -20, opacity: 0, transition: { duration: 0.35 } });
-      onSkip(card, Math.abs(velocityX));
-    } else {
-      // Snap back.
-      await controls.start({ x: 0, y: 0, rotate: 0, transition: { type: 'spring', stiffness: 300, damping: 20 } });
-    }
-  }
-
-  return (
-    <motion.div
-      className="absolute inset-0"
-      style={{
-        x: isTop ? x : 0,
-        y: isTop ? y : translateY,
-        rotate: isTop ? rotate : 0,
-        scale,
-        zIndex: 10 - stackIndex
-      }}
-      animate={isTop ? controls : { scale, y: translateY }}
-      transition={{ type: 'spring', stiffness: 260, damping: 20 }}
-      drag={isTop ? true : false}
-      dragConstraints={{ left: -300, right: 300, top: -300, bottom: 100 }}
-      dragElastic={0.15}
-      onDragEnd={isTop ? handleDragEnd : undefined}
-    >
-      {/* Swipe direction overlays (only on top card) */}
-      {isTop && (
-        <>
-          <motion.div
-            className="absolute top-8 left-6 z-20 px-4 py-1.5 rounded-xl border-4 border-green-400 text-green-400 font-black text-2xl tracking-widest rotate-[-20deg]"
-            style={{ opacity: likeOpacity }}
-          >
-            LIKE
-          </motion.div>
-          <motion.div
-            className="absolute top-8 right-6 z-20 px-4 py-1.5 rounded-xl border-4 border-red-400 text-red-400 font-black text-2xl tracking-widest rotate-[20deg]"
-            style={{ opacity: skipOpacity }}
-          >
-            NOPE
-          </motion.div>
-          <motion.div
-            className="absolute top-8 left-1/2 -translate-x-1/2 z-20 px-4 py-1.5 rounded-xl border-4 border-yellow-400 text-yellow-400 font-black text-2xl tracking-widest"
-            style={{ opacity: superlikeOpacity }}
-          >
-            SUPER ⭐
-          </motion.div>
-        </>
-      )}
-
-      <VideoCard card={card} />
-    </motion.div>
-  );
-}
-
-// ─── SwipeStack ───────────────────────────────────────────────────────────────
-
+/**
+ * Gesture-based card stack powered by `framer-motion`.
+ *
+ * Physics behaviour:
+ *   - Each card is draggable within a wide bounding box.
+ *   - Rotation is bound to horizontal offset (x → rotate) for a natural tilt.
+ *   - Opacity falls off as the card leaves the screen so skipped cards fade.
+ *   - When the user releases past `horizontalThreshold` / `verticalThreshold`
+ *     OR past `velocityThreshold` velocity, the card animates off-screen via a
+ *     spring transition and the next card becomes active.
+ *   - The next `visibleDepth` cards are rendered behind with a parallax scale
+ *     and vertical offset so the stack looks three-dimensional.
+ */
 export default function SwipeStack({
-  cards: initialCards,
-  onLike,
-  onSkip,
-  onSuperlike,
-  onEmpty
+  cards,
+  onSwipe,
+  visibleDepth = 3,
+  horizontalThreshold = 140,
+  verticalThreshold = 120,
+  velocityThreshold = 600
 }: SwipeStackProps) {
-  const [cards, setCards] = useState<CardData[]>(initialCards);
-  const dwellStart = useRef<number>(Date.now());
+  const [consumed, setConsumed] = useState(0);
 
-  const topCard = cards[0];
-  const visibleCards = cards.slice(0, 3);
+  const remaining = useMemo(() => cards.slice(consumed), [cards, consumed]);
 
-  function removeTopCard() {
-    setCards((prev) => {
-      const next = prev.slice(1);
-      if (next.length === 0) onEmpty?.();
-      return next;
-    });
-    dwellStart.current = Date.now();
-  }
+  const handleSwipeComplete = useCallback(
+    (card: SwipeCard, direction: SwipeDirection) => {
+      onSwipe?.(card, direction);
+      setConsumed((c) => c + 1);
+    },
+    [onSwipe]
+  );
 
-  function handleLike(card: CardData, velocity: number) {
-    const dwellTimeMs = Date.now() - dwellStart.current;
-    onLike?.({ ...card });
-    console.debug('like', card.id, { dwellTimeMs, velocity });
-    removeTopCard();
-  }
-
-  function handleSkip(card: CardData, velocity: number) {
-    const dwellTimeMs = Date.now() - dwellStart.current;
-    onSkip?.({ ...card });
-    console.debug('skip', card.id, { dwellTimeMs, velocity });
-    removeTopCard();
-  }
-
-  function handleSuperlike(card: CardData, velocity: number) {
-    const dwellTimeMs = Date.now() - dwellStart.current;
-    onSuperlike?.({ ...card });
-    console.debug('superlike', card.id, { dwellTimeMs, velocity });
-    removeTopCard();
-  }
-
-  if (!topCard) {
+  if (remaining.length === 0) {
     return (
-      <div className="flex items-center justify-center w-full h-full">
-        <p className="text-white/50 text-lg">No more cards 🎉</p>
+      <div className="flex h-full min-h-[420px] w-full items-center justify-center rounded-3xl border border-dashed border-white/10 bg-black/20 text-sm tracking-widest text-fog/60">
+        NO MORE CANDIDATES
       </div>
     );
   }
 
   return (
-    <div className="relative w-full h-full" style={{ perspective: 1000 }}>
-      {/* Render up to 3 stacked cards, bottom to top */}
-      {[...visibleCards].reverse().map((card, reversedIdx) => {
-        const stackIndex = visibleCards.length - 1 - reversedIdx;
-        return (
-          <SwipeCard
-            key={card.id}
-            card={card}
-            stackIndex={stackIndex}
-            total={visibleCards.length}
-            onLike={handleLike}
-            onSkip={handleSkip}
-            onSuperlike={handleSuperlike}
-          />
-        );
-      })}
-
-      {/* Action buttons */}
-      <div className="absolute -bottom-16 inset-x-0 flex justify-center items-center gap-6 z-30">
-        <motion.button
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.9 }}
-          onClick={() => handleSkip(topCard, 0)}
-          className="w-14 h-14 rounded-full bg-white/10 border border-white/20 text-2xl flex items-center justify-center shadow-lg backdrop-blur-sm"
-          aria-label="Skip"
-        >
-          ✕
-        </motion.button>
-        <motion.button
-          whileHover={{ scale: 1.15 }}
-          whileTap={{ scale: 0.85 }}
-          onClick={() => handleSuperlike(topCard, 0)}
-          className="w-12 h-12 rounded-full bg-yellow-400/20 border border-yellow-400/50 text-xl flex items-center justify-center shadow-lg backdrop-blur-sm"
-          aria-label="Superlike"
-        >
-          ⭐
-        </motion.button>
-        <motion.button
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.9 }}
-          onClick={() => handleLike(topCard, 0)}
-          className="w-14 h-14 rounded-full bg-green-500/20 border border-green-500/50 text-2xl flex items-center justify-center shadow-lg backdrop-blur-sm"
-          aria-label="Like"
-        >
-          ♥
-        </motion.button>
-      </div>
+    <div className="relative h-[520px] w-full max-w-md" role="list" aria-label="Swipe stack">
+      {remaining
+        .slice(0, visibleDepth + 1)
+        .map((card, index, arr) => {
+          // The top card (index 0) is interactive; the rest are static previews.
+          const isTop = index === 0;
+          const depth = arr.length - 1 - index; // 0 = back, large = front
+          return (
+            <SwipeCardView
+              key={card.id}
+              card={card}
+              depth={depth}
+              active={isTop}
+              horizontalThreshold={horizontalThreshold}
+              verticalThreshold={verticalThreshold}
+              velocityThreshold={velocityThreshold}
+              onSwipeComplete={handleSwipeComplete}
+            />
+          );
+        })
+        .reverse()}
     </div>
+  );
+}
+
+interface SwipeCardViewProps {
+  card: SwipeCard;
+  depth: number;
+  active: boolean;
+  horizontalThreshold: number;
+  verticalThreshold: number;
+  velocityThreshold: number;
+  onSwipeComplete: (card: SwipeCard, direction: SwipeDirection) => void;
+}
+
+function SwipeCardView({
+  card,
+  depth,
+  active,
+  horizontalThreshold,
+  verticalThreshold,
+  velocityThreshold,
+  onSwipeComplete
+}: SwipeCardViewProps) {
+  const x = useMotionValue(0);
+  const y = useMotionValue(0);
+  const rotate = useTransform(x, [-300, 0, 300], [-18, 0, 18]);
+  const likeOpacity = useTransform(x, [40, 180], [0, 1]);
+  const skipOpacity = useTransform(x, [-180, -40], [1, 0]);
+  const superOpacity = useTransform(y, [-180, -40], [1, 0]);
+
+  const [exitDirection, setExitDirection] = useState<SwipeDirection | null>(null);
+
+  const handleDragEnd = (_event: MouseEvent | TouchEvent | PointerEvent, info: PanInfo) => {
+    const { offset, velocity } = info;
+    const verticalOver =
+      offset.y < -verticalThreshold || velocity.y < -velocityThreshold;
+    const rightOver =
+      offset.x > horizontalThreshold || velocity.x > velocityThreshold;
+    const leftOver =
+      offset.x < -horizontalThreshold || velocity.x < -velocityThreshold;
+
+    if (verticalOver) {
+      setExitDirection('up');
+    } else if (rightOver) {
+      setExitDirection('right');
+    } else if (leftOver) {
+      setExitDirection('left');
+    }
+  };
+
+  // Depth-based visual styling for the stacked preview cards.
+  const restingScale = 1 - depth * 0.04;
+  const restingY = depth * 16;
+
+  return (
+    <AnimatePresence
+      onExitComplete={() => {
+        if (exitDirection) onSwipeComplete(card, exitDirection);
+      }}
+    >
+      {!exitDirection && (
+        <motion.div
+          role="listitem"
+          aria-hidden={!active}
+          drag={active}
+          dragElastic={0.6}
+          dragMomentum
+          dragConstraints={{ left: -600, right: 600, top: -600, bottom: 200 }}
+          onDragEnd={active ? handleDragEnd : undefined}
+          style={active ? { x, y, rotate } : {}}
+          initial={{ scale: restingScale * 0.98, y: restingY + 20, opacity: 0 }}
+          animate={{ scale: restingScale, y: restingY, opacity: 1 }}
+          exit={
+            exitDirection === 'up'
+              ? { y: -900, opacity: 0, transition: { duration: 0.35 } }
+              : exitDirection === 'right'
+              ? { x: 900, rotate: 24, opacity: 0, transition: { duration: 0.35 } }
+              : exitDirection === 'left'
+              ? { x: -900, rotate: -24, opacity: 0, transition: { duration: 0.35 } }
+              : { opacity: 0 }
+          }
+          transition={{ type: 'spring', stiffness: 220, damping: 26 }}
+          className="absolute inset-0 overflow-hidden rounded-3xl border border-white/10 bg-gradient-to-br from-aurora/30 via-teal/20 to-black shadow-2xl"
+        >
+          {/* Video / fallback gradient */}
+          <CardMedia card={card} />
+
+          {/* Action labels (visible during drag) */}
+          {active && (
+            <>
+              <motion.span
+                style={{ opacity: likeOpacity }}
+                className="absolute left-6 top-6 rounded-full border-2 border-emerald-400 px-3 py-1 text-sm font-semibold tracking-widest text-emerald-400"
+              >
+                LIKE
+              </motion.span>
+              <motion.span
+                style={{ opacity: skipOpacity }}
+                className="absolute right-6 top-6 rounded-full border-2 border-rose-400 px-3 py-1 text-sm font-semibold tracking-widest text-rose-400"
+              >
+                SKIP
+              </motion.span>
+              <motion.span
+                style={{ opacity: superOpacity }}
+                className="absolute left-1/2 top-8 -translate-x-1/2 rounded-full border-2 border-sky-300 px-3 py-1 text-sm font-semibold tracking-widest text-sky-300"
+              >
+                SUPERLIKE
+              </motion.span>
+            </>
+          )}
+
+          {/* Footer metadata */}
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-5 text-fog">
+            <div className="flex items-end justify-between">
+              <div>
+                <p className="text-lg font-semibold">{card.name}</p>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {card.tags.slice(0, 4).map((tag) => (
+                    <span
+                      key={tag}
+                      className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] uppercase tracking-wider"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <EloBadge rating={card.eloRating} />
+            </div>
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function CardMedia({ card }: { card: SwipeCard }) {
+  if (card.videoStreamUrl) {
+    return (
+      <video
+        key={card.videoStreamUrl}
+        src={card.videoStreamUrl}
+        autoPlay
+        playsInline
+        muted
+        loop
+        className="h-full w-full object-cover"
+      />
+    );
+  }
+  return (
+    <div
+      aria-hidden
+      className="h-full w-full bg-gradient-to-br from-aurora/40 via-teal/30 to-midnight"
+    />
+  );
+}
+
+function EloBadge({ rating }: { rating: number }) {
+  const bracket =
+    rating >= 1600
+      ? 'diamond'
+      : rating >= 1400
+      ? 'platinum'
+      : rating >= 1200
+      ? 'gold'
+      : rating >= 1000
+      ? 'silver'
+      : 'bronze';
+  const color =
+    bracket === 'diamond'
+      ? 'text-sky-300 border-sky-300'
+      : bracket === 'platinum'
+      ? 'text-zinc-200 border-zinc-200'
+      : bracket === 'gold'
+      ? 'text-amber-300 border-amber-300'
+      : bracket === 'silver'
+      ? 'text-zinc-300 border-zinc-400'
+      : 'text-orange-400 border-orange-400';
+  return (
+    <span
+      className={`rounded-full border px-3 py-1 text-[10px] uppercase tracking-widest ${color}`}
+      aria-label={`ELO ${rating}`}
+    >
+      {bracket} · {rating}
+    </span>
   );
 }

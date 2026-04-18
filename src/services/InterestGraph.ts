@@ -1,189 +1,189 @@
 /**
  * InterestGraph – weighted user-interest graph with collaborative filtering.
  *
- * Builds a bipartite graph where:
- *  - User nodes accumulate edge weights toward interests they engage with.
- *  - Interest weights are derived from swipe actions:
- *      superlike → weight += 3
- *      like      → weight += 1
- *      skip      → weight -= 0.5  (soft negative signal)
+ * Nodes  : users
+ * Edges  : mutual interest score (symmetric, non-negative)
  *
- * Collaborative filtering:
- *  "Users who liked X also liked Y" – computes cosine similarity between user
- *  interest vectors to surface candidates the requesting user hasn't seen yet.
+ * Edge weights are derived from swipe patterns:
+ *   like       → +2
+ *   superlike  → +5
+ *   skip       → -1 (weight is clamped at 0, edges cannot go negative; users
+ *                    who have only skipped each other simply carry weight 0 and
+ *                    are pruned from the adjacency list)
  *
- * Exposes:
- *  - `recordSwipe(userId, targetId, interests, action)` – update graph.
- *  - `getInterests(userId)` – return the weighted interest vector for a user.
- *  - `getSimilarity(userA, userB)` – cosine similarity in [0, 1].
- *  - `getRecommendations(userId, count)` – top-N candidates sorted by
- *    descending cosine similarity, excluding users already swiped.
+ * `getRecommendations(userId, count)` implements collaborative filtering in
+ * the classic "users who liked X also liked Y" style. For every candidate Y we
+ * sum the edge weight from the querying user U to every neighbour X multiplied
+ * by X's edge weight to Y:
+ *
+ *     score(U, Y) = Σ_x  w(U, X) × w(X, Y)
+ *
+ * Candidates Y that U already has a direct edge to are excluded, as are the
+ * user themself. The result is sorted by descending score and truncated to the
+ * requested count.
  */
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+export type SwipeAction = 'like' | 'skip' | 'superlike';
 
-const WEIGHT_SUPERLIKE = 3;
-const WEIGHT_LIKE = 1;
-const WEIGHT_SKIP = -0.5;
+/** Edge weight contribution per action. */
+export const ACTION_WEIGHTS: Record<SwipeAction, number> = {
+  like: 2,
+  superlike: 5,
+  skip: -1
+};
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-/** Weighted map of interest tags → affinity score for one user. */
-export type InterestVector = Record<string, number>;
-
-/** A single recommendation returned by `getRecommendations`. */
+/** A recommendation returned from `getRecommendations`. */
 export interface Recommendation {
   userId: string;
-  similarity: number;
-  sharedInterests: string[];
+  score: number;
+  /** Number of intermediate neighbours that contributed to the score. */
+  supportingPaths: number;
 }
 
-// ─── InterestGraph ────────────────────────────────────────────────────────────
+/** Options for `InterestGraph`. */
+export interface InterestGraphOptions {
+  /** Minimum absolute weight to keep an edge. Defaults to 0 (drop non-positive). */
+  minWeight?: number;
+  /** Per-action weight overrides. */
+  actionWeights?: Partial<Record<SwipeAction, number>>;
+}
 
+/** Internal edge map type. */
+type EdgeMap = Map<string, Map<string, number>>;
+
+/** Weighted, symmetric graph of user interests. */
 export class InterestGraph {
-  /** userId → weighted interest vector. */
-  private readonly userVectors = new Map<string, InterestVector>();
+  private readonly edges: EdgeMap = new Map();
+  private readonly minWeight: number;
+  private readonly actionWeights: Record<SwipeAction, number>;
 
-  /** userId → Set of targetIds the user has already swiped on. */
-  private readonly swipeHistory = new Map<string, Set<string>>();
+  constructor(options: InterestGraphOptions = {}) {
+    this.minWeight = options.minWeight ?? 0;
+    this.actionWeights = { ...ACTION_WEIGHTS, ...options.actionWeights };
+  }
 
-  // ── Graph mutations ──────────────────────────────────────────────────────
+  /** Record a swipe action, updating the U↔V edge symmetrically. */
+  recordAction(userId: string, targetId: string, action: SwipeAction): void {
+    if (userId === targetId) return;
+    const delta = this.actionWeights[action];
+    this.adjustEdge(userId, targetId, delta);
+  }
 
-  /**
-   * Record a swipe action and update the swiping user's interest vector.
-   *
-   * @param userId    The user who swiped.
-   * @param targetId  The user who was swiped on.
-   * @param interests Interest tags associated with the target's profile.
-   * @param action    The swipe action performed.
-   */
-  recordSwipe(
-    userId: string,
-    targetId: string,
-    interests: string[],
-    action: 'like' | 'skip' | 'superlike'
-  ): void {
-    const delta =
-      action === 'superlike' ? WEIGHT_SUPERLIKE :
-      action === 'like'      ? WEIGHT_LIKE      :
-                               WEIGHT_SKIP;
-
-    const vector = this.getOrCreateVector(userId);
-    for (const interest of interests) {
-      vector[interest] = (vector[interest] ?? 0) + delta;
+  /** Directly adjust the edge weight between two users (symmetric). */
+  adjustEdge(a: string, b: string, delta: number): number {
+    if (a === b) return 0;
+    const current = this.getEdge(a, b);
+    const next = Math.max(0, current + delta);
+    if (next <= this.minWeight) {
+      this.removeEdge(a, b);
+      return 0;
     }
-
-    // Record swipe history to exclude already-seen targets from recommendations.
-    const history = this.swipeHistory.get(userId) ?? new Set<string>();
-    history.add(targetId);
-    this.swipeHistory.set(userId, history);
+    this.getOrCreateNeighbours(a).set(b, next);
+    this.getOrCreateNeighbours(b).set(a, next);
+    return next;
   }
 
-  // ── Read accessors ───────────────────────────────────────────────────────
+  /** Remove an edge between two users. */
+  removeEdge(a: string, b: string): boolean {
+    const removedA = this.edges.get(a)?.delete(b) ?? false;
+    const removedB = this.edges.get(b)?.delete(a) ?? false;
+    return removedA || removedB;
+  }
 
-  /** Return a copy of the interest vector for a user. */
-  getInterests(userId: string): InterestVector {
-    return { ...(this.userVectors.get(userId) ?? {}) };
+  /** Return the edge weight between two users (0 when absent). */
+  getEdge(a: string, b: string): number {
+    return this.edges.get(a)?.get(b) ?? 0;
+  }
+
+  /** Return every neighbour of the user, keyed by user id. */
+  neighbours(userId: string): Map<string, number> {
+    const n = this.edges.get(userId);
+    return n ? new Map(n) : new Map();
+  }
+
+  /** Return every known node in the graph. */
+  nodes(): string[] {
+    return Array.from(this.edges.keys());
+  }
+
+  /** Return total edge count (undirected). */
+  edgeCount(): number {
+    let total = 0;
+    const seen = new Set<string>();
+    for (const [a, neighbours] of this.edges) {
+      for (const b of neighbours.keys()) {
+        const pair = a < b ? `${a}|${b}` : `${b}|${a}`;
+        if (!seen.has(pair)) {
+          seen.add(pair);
+          total += 1;
+        }
+      }
+    }
+    return total;
   }
 
   /**
-   * Compute the cosine similarity between two users' interest vectors.
-   * Returns a value in [0, 1] where 1 = identical interest profiles.
-   */
-  getSimilarity(userA: string, userB: string): number {
-    const vecA = this.userVectors.get(userA) ?? {};
-    const vecB = this.userVectors.get(userB) ?? {};
-    return cosineSimilarity(vecA, vecB);
-  }
-
-  /**
-   * Return the top-N candidate recommendations for a user based on
-   * collaborative filtering (cosine similarity on interest vectors).
+   * Collaborative filtering: "users who liked X also liked Y".
    *
-   * Excludes:
-   *  - The requesting user themselves.
-   *  - Users the requesting user has already swiped on.
-   *
-   * @param userId  The user requesting recommendations.
-   * @param count   Maximum number of recommendations to return.
+   * Walks two hops outward from `userId`, accumulating weighted scores for
+   * every two-step destination. Direct neighbours and the user themself are
+   * filtered out.
    */
   getRecommendations(userId: string, count: number): Recommendation[] {
-    const seen = this.swipeHistory.get(userId) ?? new Set<string>();
-    const results: Recommendation[] = [];
+    if (count <= 0) return [];
+    const firstHop = this.edges.get(userId);
+    if (!firstHop || firstHop.size === 0) return [];
 
-    for (const [candidateId] of this.userVectors) {
-      if (candidateId === userId) continue;
-      if (seen.has(candidateId)) continue;
-
-      const similarity = this.getSimilarity(userId, candidateId);
-      const shared = this.sharedInterests(userId, candidateId);
-      results.push({ userId: candidateId, similarity, sharedInterests: shared });
+    const scores = new Map<string, { score: number; support: number }>();
+    for (const [intermediateId, weightToIntermediate] of firstHop) {
+      const intermediateNeighbours = this.edges.get(intermediateId);
+      if (!intermediateNeighbours) continue;
+      for (const [candidateId, weightToCandidate] of intermediateNeighbours) {
+        if (candidateId === userId) continue;
+        if (firstHop.has(candidateId)) continue;
+        const contribution = weightToIntermediate * weightToCandidate;
+        if (contribution <= 0) continue;
+        const existing = scores.get(candidateId);
+        if (existing) {
+          existing.score += contribution;
+          existing.support += 1;
+        } else {
+          scores.set(candidateId, { score: contribution, support: 1 });
+        }
+      }
     }
 
-    results.sort((a, b) => b.similarity - a.similarity);
-    return results.slice(0, count);
+    return Array.from(scores.entries())
+      .map(([id, v]) => ({
+        userId: id,
+        score: Number(v.score.toFixed(4)),
+        supportingPaths: v.support
+      }))
+      .sort((a, b) => b.score - a.score || b.supportingPaths - a.supportingPaths)
+      .slice(0, count);
   }
 
-  /** Return all user IDs currently tracked in the graph. */
-  getAllUserIds(): string[] {
-    return Array.from(this.userVectors.keys());
+  /** Return top N direct neighbours by weight. */
+  topNeighbours(userId: string, count: number): Recommendation[] {
+    const list = this.edges.get(userId);
+    if (!list) return [];
+    return Array.from(list.entries())
+      .map(([id, score]) => ({ userId: id, score, supportingPaths: 1 }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, count);
   }
 
-  /**
-   * Seed a user's interest vector directly (e.g., from profile data on
-   * registration).
-   */
-  seedInterests(userId: string, vector: InterestVector): void {
-    const existing = this.getOrCreateVector(userId);
-    for (const [interest, weight] of Object.entries(vector)) {
-      existing[interest] = (existing[interest] ?? 0) + weight;
+  /** Clear the entire graph – used for tests. */
+  clear(): void {
+    this.edges.clear();
+  }
+
+  private getOrCreateNeighbours(userId: string): Map<string, number> {
+    let n = this.edges.get(userId);
+    if (!n) {
+      n = new Map();
+      this.edges.set(userId, n);
     }
+    return n;
   }
-
-  // ── Private helpers ──────────────────────────────────────────────────────
-
-  private getOrCreateVector(userId: string): InterestVector {
-    if (!this.userVectors.has(userId)) {
-      this.userVectors.set(userId, {});
-    }
-    return this.userVectors.get(userId)!;
-  }
-
-  /** Return interests present in both users' vectors with positive weights. */
-  private sharedInterests(userA: string, userB: string): string[] {
-    const vecA = this.userVectors.get(userA) ?? {};
-    const vecB = this.userVectors.get(userB) ?? {};
-    return Object.keys(vecA).filter(
-      (k) => (vecA[k] ?? 0) > 0 && (vecB[k] ?? 0) > 0
-    );
-  }
-}
-
-// ─── Pure helpers ─────────────────────────────────────────────────────────────
-
-/**
- * Compute cosine similarity between two sparse interest vectors.
- * Returns 0 if either vector has zero magnitude.
- */
-export function cosineSimilarity(vecA: InterestVector, vecB: InterestVector): number {
-  const keysA = Object.keys(vecA);
-  if (keysA.length === 0) return 0;
-
-  let dot = 0;
-  let magA = 0;
-  let magB = 0;
-
-  for (const k of keysA) {
-    const a = vecA[k] ?? 0;
-    const b = vecB[k] ?? 0;
-    dot += a * b;
-    magA += a * a;
-  }
-
-  for (const v of Object.values(vecB)) {
-    magB += v * v;
-  }
-
-  if (magA === 0 || magB === 0) return 0;
-  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }

@@ -8,9 +8,12 @@ import { MoodEngine, MoodName } from './services/MoodEngine';
 import { SessionTracker } from './services/SessionTracker';
 import { EloRatingService, SwipeOutcome } from './services/EloRatingService';
 import { HiveMindAlgorithm } from './services/HiveMindAlgorithm';
-import { SwipeProcessor, type SwipeEvent } from './services/SwipeProcessor';
-import { InterestGraph } from './services/InterestGraph';
 import { EloService } from './services/EloService';
+import { MatchQueue } from './services/MatchQueue';
+import { MatchSignaling } from './services/MatchSignaling';
+import { SwipeProcessor, type SwipeAction } from './services/SwipeProcessor';
+import { InterestGraph } from './services/InterestGraph';
+import { ReportService } from './services/ReportService';
 
 type SocketMessage =
   | { type: 'register'; userId: string; interestGraph: Record<string, number>; bciContext?: BCIContext }
@@ -34,10 +37,8 @@ const handshakeService = new BiometricHandshakeService();
 const hiveMind = new HiveMindAlgorithm();
 const matchMaker = new MatchMaker(40, hiveMind);
 const eloService = new EloRatingService();
-const glicko2Service = new EloService();
-const interestGraph = new InterestGraph();
-const swipeProcessor = new SwipeProcessor(glicko2Service);
 const sessionTracker = new SessionTracker();
+
 /** Per-session MoodEngine instances to avoid shared mutable state. */
 const sessionEngines = new Map<string, MoodEngine>();
 const clients = new Map<string, ClientState>();
@@ -53,6 +54,31 @@ function sendSafe(socket: WebSocket, payload: unknown): void {
     socket.send(JSON.stringify(payload));
   }
 }
+
+// ─── Issue #16 services ──────────────────────────────────────────────────────
+const glickoService = new EloService();
+const matchQueue = new MatchQueue();
+const interestGraph = new InterestGraph();
+const swipeProcessor = new SwipeProcessor(glickoService);
+const reportService = new ReportService({ banThreshold: 3 });
+const matchSignaling = new MatchSignaling({
+  broadcast: (userId, payload) => {
+    const target = Array.from(clients.values()).find((c) => c.profile?.id === userId);
+    if (target) sendSafe(target.socket, payload);
+  },
+  onTimeout: (room) => {
+    // Re-queue both peers when either fails to connect in time.
+    for (const peer of room.peers) {
+      const record = glickoService.getRecord(peer.userId);
+      matchQueue.enqueue(peer.userId, record.rating);
+    }
+  }
+});
+
+// When a match is popped from the queue, immediately open a signaling room.
+matchQueue.on('match', ({ a, b }) => {
+  matchSignaling.createRoom(a.userId, b.userId);
+});
 
 function terminateClient(clientId: string, reason: string): void {
   const state = clients.get(clientId);
@@ -125,138 +151,6 @@ app.get<{ Params: { userId: string } }>('/elo/:userId', async (request, reply) =
   return { ...record, bracket: eloService.getBracket(userId) };
 });
 
-// ─── Swipe / Match / Report REST routes ──────────────────────────────────────
-
-/**
- * POST /api/swipe
- * Process a rich swipe event (like | skip | superlike) and return updated ELO.
- * Body: { userId, targetId, action, dwellTimeMs, scrollVelocity, interests? }
- */
-app.post<{
-  Body: {
-    userId: string;
-    targetId: string;
-    action: 'like' | 'skip' | 'superlike';
-    dwellTimeMs: number;
-    scrollVelocity: number;
-    interests?: string[];
-  };
-}>('/api/swipe', async (request, reply) => {
-  const { userId, targetId, action, dwellTimeMs, scrollVelocity, interests = [] } = request.body;
-
-  if (!userId || !targetId || !action) {
-    return reply.status(400).send({ error: 'userId, targetId and action are required' });
-  }
-
-  if (!['like', 'skip', 'superlike'].includes(action)) {
-    return reply.status(400).send({ error: 'action must be like | skip | superlike' });
-  }
-
-  if (userId === targetId) {
-    return reply.status(400).send({ error: 'cannot swipe on self' });
-  }
-
-  if (bannedUsers.has(userId)) {
-    return reply.status(403).send({ error: 'account-banned' });
-  }
-
-  const event: SwipeEvent = { userId, targetId, action, dwellTimeMs, scrollVelocity };
-  const result = swipeProcessor.process(event);
-
-  // Update interest graph based on swipe outcome.
-  if (interests.length > 0) {
-    interestGraph.recordSwipe(userId, targetId, interests, action);
-  }
-
-  // Detect mutual match (like or superlike from both parties).
-  if (action !== 'skip') {
-    const targetLikes = mutualMatches.get(targetId);
-    if (targetLikes?.has(userId)) {
-      // Mutual match detected – emit via events if listeners are attached.
-      app.log.info({ userId, targetId }, 'mutual-match');
-    } else {
-      const userLikes = mutualMatches.get(userId) ?? new Set<string>();
-      userLikes.add(targetId);
-      mutualMatches.set(userId, userLikes);
-    }
-  }
-
-  return {
-    userRating: result.userRating,
-    targetRating: result.targetRating,
-    compatibilityDelta: result.compatibilityDelta,
-    cooldownApplied: result.cooldownApplied,
-    processedAt: result.processedAt
-  };
-});
-
-/**
- * GET /api/matches
- * Return the list of mutual matches for a user.
- * Query: { userId }
- */
-app.get<{ Querystring: { userId: string } }>('/api/matches', async (request, reply) => {
-  const { userId } = request.query;
-  if (!userId) return reply.status(400).send({ error: 'userId query param is required' });
-
-  const userLikes = mutualMatches.get(userId) ?? new Set<string>();
-  const matches: string[] = [];
-
-  for (const otherId of userLikes) {
-    const otherLikes = mutualMatches.get(otherId);
-    if (otherLikes?.has(userId)) {
-      matches.push(otherId);
-    }
-  }
-
-  return { userId, matches };
-});
-
-/**
- * GET /api/recommendations
- * Return AI-ranked candidate list for a user using the interest graph.
- * Query: { userId, count? }
- */
-app.get<{ Querystring: { userId: string; count?: string } }>('/api/recommendations', async (request, reply) => {
-  const { userId, count = '10' } = request.query;
-  if (!userId) return reply.status(400).send({ error: 'userId query param is required' });
-
-  const n = Math.min(100, Math.max(1, parseInt(count, 10) || 10));
-  const recommendations = interestGraph.getRecommendations(userId, n);
-
-  return { userId, recommendations };
-});
-
-/**
- * POST /api/report
- * Report a user. Auto-bans after 3 reports.
- * Body: { reporterId, reportedId, reason? }
- */
-app.post<{
-  Body: { reporterId: string; reportedId: string; reason?: string };
-}>('/api/report', async (request, reply) => {
-  const { reporterId, reportedId, reason } = request.body;
-
-  if (!reporterId || !reportedId) {
-    return reply.status(400).send({ error: 'reporterId and reportedId are required' });
-  }
-
-  if (reporterId === reportedId) {
-    return reply.status(400).send({ error: 'cannot report self' });
-  }
-
-  const count = (reportCounts.get(reportedId) ?? 0) + 1;
-  reportCounts.set(reportedId, count);
-
-  const autoBanned = count >= 3;
-  if (autoBanned) {
-    bannedUsers.add(reportedId);
-  }
-
-  app.log.info({ reporterId, reportedId, reason, count, autoBanned }, 'user-reported');
-
-  return { reportedId, reportCount: count, autoBanned };
-});
 
 // ─── Mood Engine REST routes ─────────────────────────────────────────────────
 
@@ -368,6 +262,164 @@ app.delete<{
     return reply.status(404).send({ error: 'session-not-found' });
   }
   return { session: state };
+});
+
+// ─── Issue #16 API routes ────────────────────────────────────────────────────
+
+/**
+ * POST /api/swipe
+ * Body: { userId, targetId, action, dwellTimeMs, scrollVelocity }
+ * Returns the updated Glicko-2 rating plus compatibility signals.
+ */
+app.post<{
+  Body: {
+    userId: string;
+    targetId: string;
+    action: SwipeAction;
+    dwellTimeMs: number;
+    scrollVelocity: number;
+  };
+}>('/api/swipe', async (request, reply) => {
+  const { userId, targetId, action, dwellTimeMs, scrollVelocity } = request.body;
+
+  if (!userId || !targetId) {
+    return reply.status(400).send({ error: 'userId and targetId are required' });
+  }
+  if (userId === targetId) {
+    return reply.status(400).send({ error: 'cannot swipe on self' });
+  }
+  if (action !== 'like' && action !== 'skip' && action !== 'superlike') {
+    return reply.status(400).send({ error: 'action must be like, skip, or superlike' });
+  }
+  if (typeof dwellTimeMs !== 'number' || dwellTimeMs < 0) {
+    return reply.status(400).send({ error: 'dwellTimeMs must be a non-negative number' });
+  }
+  if (typeof scrollVelocity !== 'number' || scrollVelocity < 0) {
+    return reply.status(400).send({ error: 'scrollVelocity must be a non-negative number' });
+  }
+  if (reportService.isBanned(userId)) {
+    return reply.status(403).send({ error: 'user-banned' });
+  }
+
+  const result = swipeProcessor.process({ userId, targetId, action, dwellTimeMs, scrollVelocity });
+  interestGraph.recordAction(userId, targetId, action);
+
+  return {
+    userId: result.userId,
+    targetId: result.targetId,
+    action: result.action,
+    compatibilityDelta: result.compatibilityDelta,
+    reasons: result.reasons,
+    cooldownApplied: result.cooldownApplied,
+    cooldownExpiresAt: result.cooldownExpiresAt,
+    viewerElo: result.viewer,
+    targetElo: result.target,
+    mutualMatch: result.mutualMatch
+  };
+});
+
+/**
+ * GET /api/matches?userId=...
+ * Returns the list of mutual matches for the user.
+ */
+app.get<{ Querystring: { userId?: string } }>('/api/matches', async (request, reply) => {
+  const { userId } = request.query;
+  if (!userId) {
+    return reply.status(400).send({ error: 'userId query parameter is required' });
+  }
+  const matches = swipeProcessor.getMutualMatches(userId).map((otherId) => {
+    const record = glickoService.getRecord(otherId);
+    return {
+      userId: otherId,
+      rating: record.rating,
+      ratingDeviation: record.ratingDeviation
+    };
+  });
+  return { userId, matches };
+});
+
+/**
+ * GET /api/recommendations?userId=...&count=10
+ * Returns AI-ranked candidate list via collaborative filtering.
+ */
+app.get<{ Querystring: { userId?: string; count?: string } }>('/api/recommendations', async (request, reply) => {
+  const { userId } = request.query;
+  if (!userId) {
+    return reply.status(400).send({ error: 'userId query parameter is required' });
+  }
+  const count = Math.min(100, Math.max(1, Number(request.query.count ?? 10) || 10));
+  const recs = interestGraph
+    .getRecommendations(userId, count)
+    .filter((r) => !reportService.isBanned(r.userId));
+  return { userId, count, recommendations: recs };
+});
+
+/**
+ * POST /api/report
+ * Body: { reporterId, targetId, reason? }
+ * Returns the resulting summary, which includes the auto-ban flag when the
+ * target has accumulated the ban threshold of distinct reporters.
+ */
+app.post<{
+  Body: { reporterId: string; targetId: string; reason?: string };
+}>('/api/report', async (request, reply) => {
+  const { reporterId, targetId, reason } = request.body;
+  if (!reporterId || !targetId) {
+    return reply.status(400).send({ error: 'reporterId and targetId are required' });
+  }
+  if (reporterId === targetId) {
+    return reply.status(400).send({ error: 'cannot report self' });
+  }
+  const outcome = reportService.report({ reporterId, targetId, reason });
+  return outcome;
+});
+
+/**
+ * POST /api/queue/enqueue
+ * Body: { userId }
+ * Enqueue a user into the bracket matchmaking queue. Attempts an immediate
+ * `popMatch`; if a peer is available, both users are atomically removed and a
+ * WebRTC signaling room is created.
+ */
+app.post<{ Body: { userId: string } }>('/api/queue/enqueue', async (request, reply) => {
+  const { userId } = request.body;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+  if (reportService.isBanned(userId)) return reply.status(403).send({ error: 'user-banned' });
+
+  const record = glickoService.getRecord(userId);
+  const queued = matchQueue.enqueue(userId, record.rating);
+  const match = matchQueue.popMatch(userId);
+  if (match) {
+    const room = matchSignaling.getRoomForUser(userId);
+    return { status: 'matched', match, room };
+  }
+  return { status: 'queued', queued };
+});
+
+/**
+ * POST /api/queue/leave
+ * Body: { userId }
+ */
+app.post<{ Body: { userId: string } }>('/api/queue/leave', async (request, reply) => {
+  const { userId } = request.body;
+  if (!userId) return reply.status(400).send({ error: 'userId is required' });
+  const removed = matchQueue.remove(userId);
+  return { removed };
+});
+
+/**
+ * POST /api/signaling/connected
+ * Body: { roomId, userId }
+ * Mark the caller as connected inside a signaling room.
+ */
+app.post<{ Body: { roomId: string; userId: string } }>('/api/signaling/connected', async (request, reply) => {
+  const { roomId, userId } = request.body;
+  if (!roomId || !userId) {
+    return reply.status(400).send({ error: 'roomId and userId are required' });
+  }
+  const room = matchSignaling.markConnected(roomId, userId);
+  if (!room) return reply.status(404).send({ error: 'room-not-found' });
+  return { room };
 });
 
 app.get('/ws', { websocket: true }, (socket) => {

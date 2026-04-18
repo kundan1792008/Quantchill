@@ -1,295 +1,170 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, useDragControls } from 'framer-motion';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+/** Discrete connection quality bands used by the indicator dot. */
+export type ConnectionQuality = 'good' | 'fair' | 'poor';
 
-export type ConnectionQuality = 'good' | 'medium' | 'poor' | 'disconnected';
-
+/** Props for the video call screen. */
 export interface VideoCallScreenProps {
-  /** Remote user's name. */
-  remoteName?: string;
-  /** Remote MediaStream (WebRTC). Null while connecting. */
+  /** Remote peer media stream (nullable while connecting). */
   remoteStream?: MediaStream | null;
-  /** Local MediaStream for the self-view PiP. */
+  /** Local camera stream for the self-view PiP. */
   localStream?: MediaStream | null;
-  /** Current connection quality indicator. */
+  /** Remote peer's display name. */
+  peerName: string;
+  /** Connection quality – re-measured by the caller from WebRTC stats. */
   connectionQuality?: ConnectionQuality;
+  /** Called when the user taps "End Call". */
   onEndCall?: () => void;
+  /** Called when the user taps "Report". */
   onReport?: () => void;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function formatDuration(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
-const QUALITY_COLORS: Record<ConnectionQuality, string> = {
-  good: '#4ade80',
-  medium: '#facc15',
-  poor: '#f97316',
-  disconnected: '#ef4444'
-};
-
-const QUALITY_LABELS: Record<ConnectionQuality, string> = {
-  good: 'Good',
-  medium: 'Fair',
-  poor: 'Poor',
-  disconnected: 'Lost'
-};
-
-// ─── VideoElement helper ──────────────────────────────────────────────────────
-
-function VideoElement({
-  stream,
-  muted,
-  className
-}: {
-  stream: MediaStream | null | undefined;
-  muted?: boolean;
-  className?: string;
-}) {
-  const ref = useRef<HTMLVideoElement>(null);
-
+/**
+ * Derive the current call duration (ms) from a single "call started" timestamp.
+ * Rendered as MM:SS in the top bar.
+ */
+function useCallTimer(startedAt: number): string {
+  const [now, setNow] = useState(Date.now());
   useEffect(() => {
-    if (ref.current && stream) {
-      ref.current.srcObject = stream;
-    }
-  }, [stream]);
-
-  return (
-    <video
-      ref={ref}
-      autoPlay
-      playsInline
-      muted={muted}
-      className={className}
-    />
-  );
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const mm = String(Math.floor(seconds / 60)).padStart(2, '0');
+  const ss = String(seconds % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
 }
 
-// ─── Draggable PiP (self-view) ────────────────────────────────────────────────
-
-function SelfViewPiP({ localStream }: { localStream?: MediaStream | null }) {
-  const [pos, setPos] = useState({ x: 0, y: 0 });
-  const isDragging = useRef(false);
-  const dragStart = useRef({ mx: 0, my: 0, px: 0, py: 0 });
-
-  function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    isDragging.current = true;
-    dragStart.current = { mx: e.clientX, my: e.clientY, px: pos.x, py: pos.y };
-    (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-  }
-
-  function onPointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isDragging.current) return;
-    setPos({
-      x: dragStart.current.px + (e.clientX - dragStart.current.mx),
-      y: dragStart.current.py + (e.clientY - dragStart.current.my)
-    });
-  }
-
-  function onPointerUp() {
-    isDragging.current = false;
-  }
-
-  return (
-    <div
-      className="absolute bottom-24 right-4 z-30 w-28 h-40 rounded-2xl overflow-hidden border-2 border-white/20 shadow-2xl bg-gray-900 cursor-grab active:cursor-grabbing"
-      style={{ transform: `translate(${pos.x}px, ${pos.y}px)`, touchAction: 'none' }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-    >
-      {localStream ? (
-        <VideoElement stream={localStream} muted className="w-full h-full object-cover scale-x-[-1]" />
-      ) : (
-        <div className="w-full h-full flex items-center justify-center text-white/30 text-3xl">📷</div>
-      )}
-    </div>
-  );
-}
-
-// ─── VideoCallScreen ──────────────────────────────────────────────────────────
-
+/**
+ * Full-screen post-match video call UI.
+ *
+ * Layout:
+ *   - Remote video fills the viewport.
+ *   - A draggable PiP self-view sits in the bottom-right (constrained to the
+ *     viewport so the user cannot drag it off-screen).
+ *   - Top bar: peer name + duration timer + coloured quality dot.
+ *   - Bottom bar: "End Call" (red) and "Report" (subtle) buttons.
+ */
 export default function VideoCallScreen({
-  remoteName = 'Unknown',
   remoteStream,
   localStream,
+  peerName,
   connectionQuality = 'good',
   onEndCall,
   onReport
 }: VideoCallScreenProps) {
-  const [elapsed, setElapsed] = useState(0);
-  const [showControls, setShowControls] = useState(true);
-  const [showReportConfirm, setShowReportConfirm] = useState(false);
-  const controlsTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-  // Call timer.
-  useEffect(() => {
-    const interval = setInterval(() => setElapsed((s) => s + 1), 1000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Auto-hide controls after 4 seconds of inactivity.
-  const resetControlsTimer = useCallback(() => {
-    setShowControls(true);
-    clearTimeout(controlsTimerRef.current);
-    controlsTimerRef.current = setTimeout(() => setShowControls(false), 4000);
-  }, []);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const dragControls = useDragControls();
+  const startedAt = useMemo(() => Date.now(), []);
+  const duration = useCallTimer(startedAt);
 
   useEffect(() => {
-    resetControlsTimer();
-    return () => clearTimeout(controlsTimerRef.current);
-  }, [resetControlsTimer]);
-
-  function handleReport() {
-    if (!showReportConfirm) {
-      setShowReportConfirm(true);
-      return;
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
     }
-    setShowReportConfirm(false);
-    onReport?.();
-  }
+  }, [remoteStream]);
 
-  const qualityColor = QUALITY_COLORS[connectionQuality];
-  const qualityLabel = QUALITY_LABELS[connectionQuality];
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream;
+    }
+  }, [localStream]);
+
+  const qualityClass =
+    connectionQuality === 'good'
+      ? 'bg-emerald-400 shadow-[0_0_12px_2px_rgba(52,211,153,0.7)]'
+      : connectionQuality === 'fair'
+      ? 'bg-amber-400 shadow-[0_0_12px_2px_rgba(250,204,21,0.7)]'
+      : 'bg-rose-500 shadow-[0_0_12px_2px_rgba(244,63,94,0.7)]';
 
   return (
     <div
-      className="relative w-full h-full bg-black overflow-hidden"
-      onClick={resetControlsTimer}
-      onPointerMove={resetControlsTimer}
+      ref={containerRef}
+      className="fixed inset-0 z-40 flex flex-col bg-black text-fog"
+      role="region"
+      aria-label={`Video call with ${peerName}`}
     >
       {/* Remote video (full screen) */}
       {remoteStream ? (
-        <VideoElement
-          stream={remoteStream}
-          className="absolute inset-0 w-full h-full object-cover"
+        <video
+          ref={remoteVideoRef}
+          autoPlay
+          playsInline
+          className="absolute inset-0 h-full w-full object-cover"
         />
       ) : (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-          <div className="text-6xl animate-pulse">📡</div>
-          <p className="text-white/60 text-lg">Connecting to {remoteName}…</p>
+        <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-aurora/20 via-midnight to-black">
+          <p className="text-sm tracking-widest text-fog/60">CONNECTING …</p>
         </div>
       )}
 
-      {/* Top HUD */}
-      <AnimatePresence>
-        {showControls && (
-          <motion.div
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -20 }}
-            transition={{ duration: 0.25 }}
-            className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-5 pt-safe-top py-4 bg-gradient-to-b from-black/60 to-transparent"
-          >
-            {/* Remote name */}
-            <div className="flex items-center gap-2">
-              <span className="text-white font-semibold text-lg">{remoteName}</span>
-            </div>
+      {/* Top bar */}
+      <div className="relative z-10 flex items-center justify-between gap-4 bg-gradient-to-b from-black/70 to-transparent px-5 py-4">
+        <div className="flex items-center gap-3">
+          <span
+            aria-label={`connection-${connectionQuality}`}
+            className={`h-2.5 w-2.5 rounded-full ${qualityClass}`}
+          />
+          <div>
+            <p className="text-base font-medium">{peerName}</p>
+            <p className="text-[11px] uppercase tracking-widest text-fog/60">{connectionQuality}</p>
+          </div>
+        </div>
+        <p className="font-mono text-sm tracking-wider text-fog/80" aria-label="call duration">
+          {duration}
+        </p>
+      </div>
 
-            {/* Timer */}
-            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-black/40 backdrop-blur-sm">
-              <span className="text-white/80 text-sm font-mono">{formatDuration(elapsed)}</span>
-            </div>
+      <div className="relative flex-1" />
 
-            {/* Connection quality */}
-            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-black/40 backdrop-blur-sm">
-              <div
-                className="w-2.5 h-2.5 rounded-full"
-                style={{ backgroundColor: qualityColor, boxShadow: `0 0 6px ${qualityColor}` }}
-              />
-              <span className="text-white/70 text-xs">{qualityLabel}</span>
-            </div>
-          </motion.div>
+      {/* Bottom action bar */}
+      <div className="relative z-10 flex items-center justify-center gap-6 bg-gradient-to-t from-black/80 to-transparent px-6 py-6">
+        <button
+          type="button"
+          onClick={onReport}
+          className="rounded-full border border-white/20 px-5 py-2 text-xs uppercase tracking-widest text-fog/80 hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-aurora"
+        >
+          Report
+        </button>
+        <button
+          type="button"
+          onClick={onEndCall}
+          className="rounded-full bg-rose-500 px-6 py-3 text-sm font-semibold uppercase tracking-widest text-white shadow-lg shadow-rose-500/40 hover:bg-rose-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
+        >
+          End Call
+        </button>
+      </div>
+
+      {/* Draggable self-view PiP */}
+      <motion.div
+        drag
+        dragControls={dragControls}
+        dragMomentum={false}
+        dragConstraints={containerRef}
+        dragElastic={0.15}
+        initial={{ x: 0, y: 0 }}
+        className="absolute bottom-24 right-5 z-20 h-40 w-28 cursor-grab overflow-hidden rounded-2xl border border-white/20 bg-black shadow-xl active:cursor-grabbing"
+        aria-label="self-view"
+      >
+        {localStream ? (
+          <video
+            ref={localVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-teal/30 to-midnight text-[10px] tracking-widest text-fog/70">
+            CAMERA OFF
+          </div>
         )}
-      </AnimatePresence>
-
-      {/* Self-view PiP */}
-      <SelfViewPiP localStream={localStream} />
-
-      {/* Bottom controls */}
-      <AnimatePresence>
-        {showControls && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 20 }}
-            transition={{ duration: 0.25 }}
-            className="absolute bottom-0 inset-x-0 z-20 flex items-center justify-center gap-6 pb-safe-bottom py-6 bg-gradient-to-t from-black/70 to-transparent"
-          >
-            {/* Report button */}
-            <motion.button
-              whileHover={{ scale: 1.08 }}
-              whileTap={{ scale: 0.92 }}
-              onClick={handleReport}
-              className={[
-                'w-12 h-12 rounded-full flex items-center justify-center shadow-xl text-xl',
-                showReportConfirm
-                  ? 'bg-orange-500/80 border-2 border-orange-400'
-                  : 'bg-white/10 border border-white/20 backdrop-blur-sm'
-              ].join(' ')}
-              aria-label={showReportConfirm ? 'Confirm report' : 'Report user'}
-              title={showReportConfirm ? 'Tap again to confirm report' : 'Report user'}
-            >
-              {showReportConfirm ? '⚠️' : '🚩'}
-            </motion.button>
-
-            {/* End call button */}
-            <motion.button
-              whileHover={{ scale: 1.08 }}
-              whileTap={{ scale: 0.92 }}
-              onClick={onEndCall}
-              className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center shadow-xl text-2xl border-2 border-red-400"
-              aria-label="End call"
-            >
-              📵
-            </motion.button>
-
-            {/* Placeholder spacer to balance layout */}
-            <div className="w-12 h-12" />
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Report confirmation overlay */}
-      <AnimatePresence>
-        {showReportConfirm && (
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.95 }}
-            className="absolute inset-x-4 bottom-28 z-40 rounded-2xl bg-black/90 border border-white/10 p-4 text-center shadow-2xl backdrop-blur-sm"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <p className="text-white font-semibold mb-1">Report {remoteName}?</p>
-            <p className="text-white/50 text-xs mb-3">
-              After 3 reports, users are automatically banned.
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setShowReportConfirm(false)}
-                className="flex-1 py-2 rounded-xl bg-white/10 text-white text-sm"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleReport}
-                className="flex-1 py-2 rounded-xl bg-orange-500 text-white text-sm font-semibold"
-              >
-                Report
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      </motion.div>
     </div>
   );
 }
