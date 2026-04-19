@@ -133,7 +133,7 @@ export class SwipeProcessor {
     const trace = this.getTrace(event.userId);
     if (now < trace.cooldownUntil) {
       // Still in an existing cooldown – keep original expiry visible.
-      cooldownApplied = false;
+      cooldownApplied = true;
       cooldownExpiresAt = trace.cooldownUntil;
     }
     if (event.action === 'skip') {

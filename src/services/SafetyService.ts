@@ -34,6 +34,8 @@ export interface SafetyServiceOptions {
   autoBlockThreshold?: number;
   /** Rolling window for auto-block counting, in ms. */
   autoBlockWindowMs?: number;
+  /** Maximum number of reports to retain in memory. Default 10000. */
+  maxReports?: number;
   /** Injected clock; matches repo test convention. */
   nowFn?: () => number;
 }
@@ -46,15 +48,20 @@ export class SafetyService {
 
   private readonly autoBlockThreshold: number;
   private readonly autoBlockWindowMs: number;
+  private readonly maxReports: number;
   private readonly nowFn: () => number;
 
   constructor(options: SafetyServiceOptions = {}) {
     this.autoBlockThreshold = options.autoBlockThreshold ?? 5;
     this.autoBlockWindowMs = options.autoBlockWindowMs ?? 24 * 60 * 60 * 1000;
+    this.maxReports = options.maxReports ?? 10_000;
     this.nowFn = options.nowFn ?? Date.now;
 
     if (this.autoBlockThreshold <= 0 || this.autoBlockWindowMs <= 0) {
       throw new Error('SafetyService: autoBlockThreshold and autoBlockWindowMs must be positive');
+    }
+    if (this.maxReports <= 0) {
+      throw new Error('SafetyService: maxReports must be positive');
     }
   }
 
@@ -134,6 +141,11 @@ export class SafetyService {
       createdAtMs: now
     };
     this.reports.push(record);
+
+    // Prune old reports beyond maxReports limit (FIFO).
+    if (this.reports.length > this.maxReports) {
+      this.reports.splice(0, this.reports.length - this.maxReports);
+    }
 
     const distinctReporters = new Set<string>();
     for (const r of this.reports) {

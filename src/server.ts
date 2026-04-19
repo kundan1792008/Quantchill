@@ -128,7 +128,16 @@ const matchSignaling = new MatchSignaling({
 
 // When a match is popped from the queue, immediately open a signaling room.
 matchQueue.on('match', ({ a, b }) => {
-  matchSignaling.createRoom(a.userId, b.userId);
+  try {
+    matchSignaling.createRoom(a.userId, b.userId);
+  } catch (error) {
+    app.log.error({ error, userA: a.userId, userB: b.userId }, 'Failed to create signaling room');
+    // Re-queue both users on room creation failure.
+    const recordA = glickoService.getRecord(a.userId);
+    const recordB = glickoService.getRecord(b.userId);
+    matchQueue.enqueue(a.userId, recordA.rating);
+    matchQueue.enqueue(b.userId, recordB.rating);
+  }
 });
 
 function terminateClient(clientId: string, reason: string): void {
@@ -689,6 +698,23 @@ app.get('/ws', { websocket: true }, (socket) => {
     }
 
     if (message.type === 'register') {
+      // Validate userId and interestGraph
+      if (!message.userId || typeof message.userId !== 'string') {
+        sendSafe(socket, { type: 'error', message: 'valid-userId-required' });
+        return;
+      }
+      if (!message.interestGraph || typeof message.interestGraph !== 'object' || Array.isArray(message.interestGraph)) {
+        sendSafe(socket, { type: 'error', message: 'valid-interestGraph-required' });
+        return;
+      }
+      // Validate interestGraph values are numbers
+      for (const [key, value] of Object.entries(message.interestGraph)) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          sendSafe(socket, { type: 'error', message: 'interestGraph-values-must-be-numbers' });
+          return;
+        }
+      }
+
       const eloRecord = eloService.getRecord(message.userId);
       currentClient.profile = {
         id: message.userId,
@@ -877,6 +903,22 @@ app.get('/ws', { websocket: true }, (socket) => {
   });
 
   socket.on('close', () => {
+    const state = clients.get(clientId);
+
+    // Comprehensive cleanup on disconnect
+    if (state?.profile) {
+      const userId = state.profile.id;
+
+      // Remove from match queue if queued
+      matchQueue.remove(userId);
+
+      // Close any active signaling room
+      const room = matchSignaling.getRoomForUser(userId);
+      if (room) {
+        matchSignaling.closeRoom(room.roomId, 'user-disconnected');
+      }
+    }
+
     clients.delete(clientId);
     rateLimiter.reset(clientId);
   });
