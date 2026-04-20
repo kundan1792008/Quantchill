@@ -73,6 +73,10 @@ export class MoodEngine {
   private readonly engagementThreshold: number;
 
   constructor(initialMood: MoodName = 'Deep Focus', engagementThreshold = 40) {
+    // Validate engagementThreshold
+    if (!Number.isFinite(engagementThreshold) || engagementThreshold < 0 || engagementThreshold > 100) {
+      throw new Error('engagementThreshold must be a finite number between 0 and 100');
+    }
     this.currentMood = initialMood;
     this.engagementThreshold = engagementThreshold;
   }

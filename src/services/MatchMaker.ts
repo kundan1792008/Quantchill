@@ -63,6 +63,8 @@ export class MatchMaker {
   rankCandidates(user: UserProfile, candidates: UserProfile[], context: BCIContext): MatchResult[] {
     const prioritizeVip = this.shouldEscalateToPriorityFeed(context);
     const userElo = user.eloRating ?? 1000;
+    // Calculate shouldTransitionLoop once instead of per-candidate
+    const shouldTransition = this.shouldTransitionLoop(context);
 
     return candidates
       .filter((candidate) => candidate.id !== user.id)
@@ -75,7 +77,7 @@ export class MatchMaker {
         return {
           candidate,
           score: Number(Math.min(100, base + eloBonus).toFixed(2)),
-          shouldTransitionLoop: this.shouldTransitionLoop(context)
+          shouldTransitionLoop: shouldTransition
         };
       })
       .sort((a, b) => {

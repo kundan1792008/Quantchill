@@ -29,12 +29,16 @@ export interface RateLimitDecision {
 interface Bucket {
   tokens: number;
   updatedAtMs: number;
+  lastAccessMs: number; // Track last access for garbage collection
 }
 
 export type NowFn = () => number;
 
 export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>();
+  private readonly STALE_THRESHOLD_MS = 3600000; // 1 hour
+  private lastCleanupMs = 0;
+  private readonly CLEANUP_INTERVAL_MS = 300000; // 5 minutes
 
   constructor(
     private readonly rules: Record<string, RateLimitRule>,
@@ -59,11 +63,15 @@ export class RateLimiter {
 
     const bucketKey = `${action}::${key}`;
     const now = this.nowFn();
+
+    // Periodically clean up stale buckets
+    this.maybeCleanupStaleBuckets(now);
+
     const existing = this.buckets.get(bucketKey);
 
     const bucket: Bucket = existing
-      ? this.refill(existing, rule, now)
-      : { tokens: rule.capacity, updatedAtMs: now };
+      ? { ...this.refill(existing, rule, now), lastAccessMs: now }
+      : { tokens: rule.capacity, updatedAtMs: now, lastAccessMs: now };
 
     if (bucket.tokens >= 1) {
       bucket.tokens -= 1;
@@ -105,12 +113,29 @@ export class RateLimiter {
     return Number(refilled.tokens.toFixed(4));
   }
 
+  /** Clean up buckets that haven't been accessed in over an hour */
+  private maybeCleanupStaleBuckets(now: number): void {
+    if (now - this.lastCleanupMs < this.CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastCleanupMs = now;
+    const cutoff = now - this.STALE_THRESHOLD_MS;
+
+    for (const [key, bucket] of this.buckets.entries()) {
+      if (bucket.lastAccessMs < cutoff) {
+        this.buckets.delete(key);
+      }
+    }
+  }
+
   private refill(bucket: Bucket, rule: RateLimitRule, now: number): Bucket {
     const elapsedMs = Math.max(0, now - bucket.updatedAtMs);
     const refill = (elapsedMs / 1000) * rule.refillPerSec;
     return {
       tokens: Math.min(rule.capacity, bucket.tokens + refill),
-      updatedAtMs: now
+      updatedAtMs: now,
+      lastAccessMs: bucket.lastAccessMs
     };
   }
 }

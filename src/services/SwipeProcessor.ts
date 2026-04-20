@@ -138,10 +138,10 @@ export class SwipeProcessor {
     }
     if (event.action === 'skip') {
       trace.timestamps.push(now);
-      // Drop entries outside the window.
+      // Drop entries outside the window - use filter instead of shift for better performance
       const cutoff = now - this.rapidSkipWindowMs;
-      while (trace.timestamps.length > 0 && trace.timestamps[0] < cutoff) {
-        trace.timestamps.shift();
+      if (trace.timestamps.length > 0 && trace.timestamps[0] < cutoff) {
+        trace.timestamps = trace.timestamps.filter(ts => ts >= cutoff);
       }
       if (trace.timestamps.length >= this.rapidSkipThreshold && now >= trace.cooldownUntil) {
         trace.cooldownUntil = now + this.cooldownMs;
