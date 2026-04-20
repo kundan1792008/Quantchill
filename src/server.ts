@@ -456,7 +456,26 @@ app.post<{
     return reply.status(500).send({ error: 'session-engine-not-found' });
   }
 
-  const transition = engine.evaluateBCIContext(request.body.bciContext);
+  // Validate BCI context to prevent malicious input
+  const bciContext = request.body.bciContext;
+  if (!bciContext || typeof bciContext !== 'object') {
+    return reply.status(400).send({ error: 'valid-bciContext-required' });
+  }
+
+  // Validate numeric fields are in reasonable ranges
+  if (typeof bciContext.engagementScore === 'number') {
+    if (!Number.isFinite(bciContext.engagementScore) ||
+        bciContext.engagementScore < 0 ||
+        bciContext.engagementScore > 100) {
+      return reply.status(400).send({ error: 'engagementScore must be between 0 and 100' });
+    }
+  }
+
+  if (typeof bciContext.eyeTrackingFocus === 'number' && !Number.isFinite(bciContext.eyeTrackingFocus)) {
+    return reply.status(400).send({ error: 'eyeTrackingFocus must be finite' });
+  }
+
+  const transition = engine.evaluateBCIContext(bciContext);
   const track = engine.generateTrack();
 
   return { transition: transition ?? null, track };
@@ -524,21 +543,26 @@ app.post<{
     return reply.status(403).send({ error: 'user-banned' });
   }
 
-  const result = swipeProcessor.process({ userId, targetId, action, dwellTimeMs, scrollVelocity });
-  interestGraph.recordAction(userId, targetId, action);
+  try {
+    const result = swipeProcessor.process({ userId, targetId, action, dwellTimeMs, scrollVelocity });
+    interestGraph.recordAction(userId, targetId, action);
 
-  return {
-    userId: result.userId,
-    targetId: result.targetId,
-    action: result.action,
-    compatibilityDelta: result.compatibilityDelta,
-    reasons: result.reasons,
-    cooldownApplied: result.cooldownApplied,
-    cooldownExpiresAt: result.cooldownExpiresAt,
-    viewerElo: result.viewer,
-    targetElo: result.target,
-    mutualMatch: result.mutualMatch
-  };
+    return {
+      userId: result.userId,
+      targetId: result.targetId,
+      action: result.action,
+      compatibilityDelta: result.compatibilityDelta,
+      reasons: result.reasons,
+      cooldownApplied: result.cooldownApplied,
+      cooldownExpiresAt: result.cooldownExpiresAt,
+      viewerElo: result.viewer,
+      targetElo: result.target,
+      mutualMatch: result.mutualMatch
+    };
+  } catch (error) {
+    app.log.error({ error, userId, targetId }, 'Swipe processing error');
+    return reply.status(400).send({ error: (error as Error).message });
+  }
 });
 
 /**
@@ -707,6 +731,12 @@ app.get('/ws', { websocket: true }, (socket) => {
         sendSafe(socket, { type: 'error', message: 'valid-interestGraph-required' });
         return;
       }
+      // Limit interestGraph size to prevent memory exhaustion attacks
+      const MAX_INTEREST_KEYS = 1000;
+      if (Object.keys(message.interestGraph).length > MAX_INTEREST_KEYS) {
+        sendSafe(socket, { type: 'error', message: 'interestGraph-too-large' });
+        return;
+      }
       // Validate interestGraph values are numbers
       for (const [key, value] of Object.entries(message.interestGraph)) {
         if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -747,7 +777,11 @@ app.get('/ws', { websocket: true }, (socket) => {
       const viewerId = currentClient.profile.id;
       const candidates = Array.from(clients.values())
         .filter((client) => client.authenticated && client.profile)
-        .map((client) => syncEloToProfile(client.profile as UserProfile))
+        .map((client) => {
+          // Safe assertion: we just filtered for client.profile existence
+          const profile = client.profile as UserProfile;
+          return syncEloToProfile(profile);
+        })
         .filter((candidate) => !safetyService.isBlocked(viewerId, candidate.id));
 
       const ranked = matchMaker.rankCandidates(currentClient.profile, candidates, message.bciContext);
@@ -902,6 +936,11 @@ app.get('/ws', { websocket: true }, (socket) => {
     }
   });
 
+  socket.on('error', (error) => {
+    app.log.error({ error, clientId }, 'WebSocket error');
+    // The 'close' event will follow automatically, triggering cleanup
+  });
+
   socket.on('close', () => {
     const state = clients.get(clientId);
 
@@ -916,6 +955,15 @@ app.get('/ws', { websocket: true }, (socket) => {
       const room = matchSignaling.getRoomForUser(userId);
       if (room) {
         matchSignaling.closeRoom(room.roomId, 'user-disconnected');
+      }
+
+      // Clean up orphaned session engines for this user
+      // Find all sessions for this user and delete them
+      for (const [sessionId, engine] of sessionEngines.entries()) {
+        const session = sessionTracker.getSession(sessionId);
+        if (session && session.userId === userId) {
+          sessionEngines.delete(sessionId);
+        }
       }
     }
 
