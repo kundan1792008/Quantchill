@@ -3,6 +3,8 @@
 import { useCallback } from 'react';
 import DiscoveryFeed, { DiscoveryCandidate } from '@/components/DiscoveryFeed';
 
+const MOCK_LOAD_DELAY_MS = 200;
+
 const INITIAL_CANDIDATES: DiscoveryCandidate[] = [
   {
     id: 'cand-1',
@@ -41,7 +43,7 @@ const INITIAL_CANDIDATES: DiscoveryCandidate[] = [
 export default function DiscoveryPage() {
   const loadMore = useCallback(async (cursor: string | null): Promise<DiscoveryCandidate[]> => {
     const seed = cursor ?? 'seed';
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, MOCK_LOAD_DELAY_MS));
 
     return Array.from({ length: 4 }).map((_, index) => {
       const serial = `${seed}-${index + 1}`;

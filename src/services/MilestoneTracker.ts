@@ -67,6 +67,12 @@ const TIERS: readonly TierConfig[] = [
   }
 ] as const;
 
+const PROGRESS_WEIGHTS = {
+  messages: 0.35,
+  minutes: 0.35,
+  compatibility: 0.3
+} as const;
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -131,7 +137,9 @@ export class MilestoneTracker {
     const minuteProgress = elapsedMinutes / nextTier.minMinutes;
     const compatibilityProgress = compatibilityScore / nextTier.minCompatibility;
     const progressPct = clamp(
-      ((messageProgress * 0.35 + minuteProgress * 0.35 + compatibilityProgress * 0.3) * 100),
+      ((messageProgress * PROGRESS_WEIGHTS.messages +
+        minuteProgress * PROGRESS_WEIGHTS.minutes +
+        compatibilityProgress * PROGRESS_WEIGHTS.compatibility) * 100),
       0,
       99.9
     );

@@ -28,6 +28,23 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+const PREDICTIVE_SCORE_WEIGHTS = {
+  compatibility: 0.62,
+  freshness: 0.23,
+  interestBreadth: 0.1,
+  momentum: 0.05
+} as const;
+
+const ENTROPY_CYCLE = 3;
+const ENTROPY_PENALTY_FACTOR = 0.008;
+
+const MOMENTUM_DELTA = {
+  super: 0.18,
+  like: 0.08,
+  skip: -0.12
+} as const;
+const INITIAL_MOMENTUM = 0.5;
+
 function scoreCandidate(candidate: DiscoveryCandidate, momentum: number): number {
   const compatibility = clamp(candidate.compatibilityScore / 100, 0, 1);
   const freshness = clamp(candidate.freshness, 0, 1);
@@ -37,12 +54,18 @@ function scoreCandidate(candidate: DiscoveryCandidate, momentum: number): number
   // - compatibility anchors relevance
   // - freshness keeps feed dynamic
   // - momentum reduces repeated low-interest cards in a row
-  return compatibility * 0.62 + freshness * 0.23 + interestBreadth * 0.1 + momentum * 0.05;
+  return (
+    compatibility * PREDICTIVE_SCORE_WEIGHTS.compatibility +
+    freshness * PREDICTIVE_SCORE_WEIGHTS.freshness +
+    interestBreadth * PREDICTIVE_SCORE_WEIGHTS.interestBreadth +
+    momentum * PREDICTIVE_SCORE_WEIGHTS.momentum
+  );
 }
 
 function reorderForContinuity(candidates: DiscoveryCandidate[], engagementMomentum: number): DiscoveryCandidate[] {
   const scored = candidates.map((candidate, index) => {
-    const entropyPenalty = (index % 3) * 0.008;
+    // Apply a tiny cyclic penalty so similarly-scored cards are not shown in a rigid order.
+    const entropyPenalty = (index % ENTROPY_CYCLE) * ENTROPY_PENALTY_FACTOR;
     return {
       candidate,
       score: scoreCandidate(candidate, engagementMomentum) - entropyPenalty
@@ -58,21 +81,22 @@ export default function DiscoveryFeed({
   loadMore,
   prefetchThreshold = 4
 }: DiscoveryFeedProps) {
-  const [queue, setQueue] = useState<DiscoveryCandidate[]>(() => reorderForContinuity(initialCandidates, 0.5));
+  const [queue, setQueue] = useState<DiscoveryCandidate[]>(() =>
+    reorderForContinuity(initialCandidates, INITIAL_MOMENTUM)
+  );
   const [cursor, setCursor] = useState<string | null>(
     initialCandidates.length > 0 ? initialCandidates[initialCandidates.length - 1]!.id : null
   );
-  const [activeIndex, setActiveIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [engagementMomentum, setEngagementMomentum] = useState(0.5);
+  const [engagementMomentum, setEngagementMomentum] = useState(INITIAL_MOMENTUM);
 
   const loadLock = useRef<Promise<void> | null>(null);
 
-  const visible = useMemo(() => queue.slice(activeIndex, activeIndex + 3), [queue, activeIndex]);
+  const visible = useMemo(() => queue.slice(0, 3), [queue]);
 
   const prefetchIfNeeded = useCallback(async () => {
-    const remaining = queue.length - activeIndex;
+    const remaining = queue.length;
     if (remaining > prefetchThreshold || isLoading) return;
     if (loadLock.current) return;
 
@@ -85,11 +109,9 @@ export default function DiscoveryFeed({
           const last = next[next.length - 1];
           setCursor(last?.id ?? cursor);
           setQueue((previous) => {
-            const unconsumed = previous.slice(activeIndex);
-            const merged = [...unconsumed, ...next];
+            const merged = [...previous, ...next];
             return reorderForContinuity(merged, engagementMomentum);
           });
-          setActiveIndex(0);
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unable to load additional candidates');
@@ -100,7 +122,7 @@ export default function DiscoveryFeed({
     })();
 
     await loadLock.current;
-  }, [activeIndex, cursor, engagementMomentum, isLoading, loadMore, prefetchThreshold, queue]);
+  }, [cursor, engagementMomentum, isLoading, loadMore, prefetchThreshold, queue]);
 
   useEffect(() => {
     void prefetchIfNeeded();
@@ -108,12 +130,13 @@ export default function DiscoveryFeed({
 
   const consumeCard = useCallback(
     (signal: 'skip' | 'like' | 'super') => {
+      if (queue.length === 0) return;
+
       setEngagementMomentum((current) => {
-        const delta = signal === 'super' ? 0.18 : signal === 'like' ? 0.08 : -0.12;
+        const delta = MOMENTUM_DELTA[signal];
         return clamp(current + delta, 0.1, 1);
       });
-
-      setActiveIndex((index) => Math.min(index + 1, Math.max(0, queue.length - 1)));
+      setQueue((previous) => previous.slice(1));
     },
     [queue.length]
   );

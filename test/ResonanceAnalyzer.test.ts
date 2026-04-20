@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { InteractionEvent, ResonanceAnalyzer } from '../src/services/ResonanceAnalyzer';
 
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const TWENTY_FIVE_HOURS_MS = 25 * ONE_HOUR_MS;
+
 function makeEvent(overrides: Partial<InteractionEvent> = {}): InteractionEvent {
   return {
     userId: 'u1',
@@ -34,8 +37,8 @@ test('ResonanceAnalyzer enforces 24-hour rolling window updates', () => {
   const nowMs = 1_700_000_000_000;
   const analyzer = new ResonanceAnalyzer(() => nowMs);
 
-  const stale = makeEvent({ occurredAtMs: nowMs - (25 * 60 * 60 * 1000) });
-  const fresh = makeEvent({ occurredAtMs: nowMs - (2 * 60 * 60 * 1000) });
+  const stale = makeEvent({ occurredAtMs: nowMs - TWENTY_FIVE_HOURS_MS });
+  const fresh = makeEvent({ occurredAtMs: nowMs - (2 * ONE_HOUR_MS) });
 
   const inWindow = analyzer.filterToRollingWindow([stale, fresh]);
   assert.equal(inWindow.length, 1);

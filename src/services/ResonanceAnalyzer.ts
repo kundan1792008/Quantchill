@@ -39,6 +39,7 @@ export interface CompatibilityGraph {
 }
 
 const ROLLING_WINDOW_MS = 24 * 60 * 60 * 1000;
+const MIN_RESPONSIVENESS_DURATION_MS = 30 * 1000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -57,9 +58,9 @@ function cosineSimilarity(left: number[], right: number[]): number {
   let dot = 0;
   let lMag = 0;
   let rMag = 0;
-  for (let i = 0; i < left.length; i++) {
-    const l = left[i] ?? 0;
-    const r = right[i] ?? 0;
+  for (let index = 0; index < left.length; index++) {
+    const l = left[index] ?? 0;
+    const r = right[index] ?? 0;
     dot += l * r;
     lMag += l * l;
     rMag += r * r;
@@ -120,7 +121,10 @@ export class ResonanceAnalyzer {
     );
 
     // Responsiveness proxy: more turns in less time indicates tighter conversational cadence.
-    const responsiveness = clamp((averageTurns * 60_000) / Math.max(1, averageTimeSpentMs), 0, 1);
+    const responsiveness =
+      averageTimeSpentMs < MIN_RESPONSIVENESS_DURATION_MS
+        ? 0
+        : clamp((averageTurns * 60_000) / averageTimeSpentMs, 0, 1);
 
     const sustainedConversationRate = clamp(sustainedCount / interactionCount24h, 0, 1);
 
